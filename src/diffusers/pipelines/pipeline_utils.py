@@ -126,9 +126,12 @@ class ImagePipelineOutput(BaseOutput):
         images (`List[PIL.Image.Image]` or `np.ndarray`)
             List of denoised PIL images of length `batch_size` or NumPy array of shape `(batch_size, height, width,
             num_channels)`.
+        masks (`List[PIL.Image.Image]` or `np.ndarray`, *optional*)
+            List of denoised masks of length `batch_size` or NumPy array of shape `(batch_size, height, width)`.
     """
 
     images: list[PIL.Image.Image] | np.ndarray
+    masks: list[PIL.Image.Image] | np.ndarray | None = None
 
 
 @dataclass
