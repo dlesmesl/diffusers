@@ -131,6 +131,8 @@ class KandinskyV22CombinedPipeline(DiffusionPipeline):
             A scheduler to be used in combination with `prior` to generate image embedding.
         prior_image_processor ([`CLIPImageProcessor`]):
             A image_processor to be used to preprocess image from clip.
+        segment_flag (bool, *optional*, defaults to False):
+            Whether to enable segmentation during image generation.
     """
 
     model_cpu_offload_seq = "prior_text_encoder->prior_image_encoder->unet->movq"
@@ -148,6 +150,7 @@ class KandinskyV22CombinedPipeline(DiffusionPipeline):
         prior_tokenizer: CLIPTokenizer,
         prior_scheduler: UnCLIPScheduler,
         prior_image_processor: CLIPImageProcessor,
+        segment_flag = False
     ):
         super().__init__()
 
@@ -174,6 +177,7 @@ class KandinskyV22CombinedPipeline(DiffusionPipeline):
             unet=unet,
             scheduler=scheduler,
             movq=movq,
+            segment_flag=segment_flag
         )
 
     def enable_xformers_memory_efficient_attention(self, attention_op: Optional[Callable] = None):

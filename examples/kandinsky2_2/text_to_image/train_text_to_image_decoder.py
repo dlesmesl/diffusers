@@ -24,6 +24,8 @@ import accelerate
 import datasets
 import numpy as np
 import torch
+import torch.nn as nn
+from torch.nn.parameter import Parameter
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
@@ -38,6 +40,7 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 from transformers.utils import ContextManagers
+from custom_datasets.paireddataset import PairedDataset
 
 import diffusers
 from diffusers import AutoPipelineForText2Image, DDPMScheduler, UNet2DConditionModel, VQModel
@@ -144,6 +147,7 @@ def log_validation(vae, image_encoder, image_processor, unet, args, accelerator,
         prior_image_processor=image_processor,
         unet=accelerator.unwrap_model(unet),
         torch_dtype=weight_dtype,
+        segment_flag=args.segment,
     )
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
@@ -157,16 +161,23 @@ def log_validation(vae, image_encoder, image_processor, unet, args, accelerator,
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
     images = []
+    masks = []
     for i in range(len(args.validation_prompts)):
         with torch.autocast("cuda"):
-            image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
+            predictions = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator)
+            image = predictions.images[0]
+            mask = predictions.masks[0] if predictions.masks else None
 
         images.append(image)
+        masks.append(mask) if mask else None
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
             tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+            if args.segment:
+                np_masks = np.stack([np.asarray(msk) for msk in masks])
+                tracker.writer.add_images("validation_masks", np_masks, epoch, dataformats="NHWC")
         elif tracker.name == "wandb":
             tracker.log(
                 {
@@ -176,6 +187,15 @@ def log_validation(vae, image_encoder, image_processor, unet, args, accelerator,
                     ]
                 }
             )
+            if args.segment:
+                tracker.log(
+                    {
+                        "validation_masks": [
+                            wandb.Image(mask, caption=f"{i}: {args.validation_prompts[i]}")
+                            for i, mask in enumerate(masks)
+                        ]
+                    }
+                )
         else:
             logger.warning(f"image logging not implemented for {tracker.name}")
 
@@ -425,6 +445,14 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+    # Generation + segmentation flag
+    parser.add_argument(
+        "--segment",
+        action="store_true",
+        help=(
+            "Flag to activate image generation with segmentation mask."
+        ),
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -437,6 +465,34 @@ def parse_args():
 
     return args
 
+def modify_unet_conv_layers(unet, new_in_channels=None, new_out_channels=None):
+    """
+    Modifies the UNet's input and/or output convolutional layers to have new channel sizes.
+    """
+    if new_in_channels is not None:
+        old_conv_in = unet.conv_in
+        weight_in = old_conv_in.weight.clone()
+        bias_in = old_conv_in.bias.clone()
+        weight_in = weight_in.repeat(1, new_in_channels // old_conv_in.in_channels, 1, 1) * 0.5
+        new_conv_in = nn.Conv2d(new_in_channels, old_conv_in.out_channels, kernel_size=old_conv_in.kernel_size,
+                                stride=old_conv_in.stride, padding=old_conv_in.padding)
+        new_conv_in.weight = Parameter(weight_in)
+        new_conv_in.bias = Parameter(bias_in)
+        unet.conv_in = new_conv_in
+        unet.config["in_channels"] = new_in_channels
+
+    if new_out_channels is not None:
+        old_conv_out = unet.conv_out
+        weight_out = old_conv_out.weight.clone()
+        bias_out = old_conv_out.bias.clone()
+        weight_out = weight_out.repeat(new_out_channels // old_conv_out.out_channels, 1, 1, 1) * 0.5
+        bias_out = bias_out.repeat(new_out_channels // old_conv_out.out_channels) * 0.5
+        new_conv_out = nn.Conv2d(old_conv_out.in_channels, new_out_channels, kernel_size=old_conv_out.kernel_size,
+                                 stride=old_conv_out.stride, padding=old_conv_out.padding)
+        new_conv_out.weight = Parameter(weight_out)
+        new_conv_out.bias = Parameter(bias_out)
+        unet.conv_out = new_conv_out
+        unet.config["out_channels"] = new_out_channels
 
 def main():
     args = parse_args()
@@ -519,6 +575,10 @@ def main():
             args.pretrained_prior_model_name_or_path, subfolder="image_encoder", torch_dtype=weight_dtype
         ).eval()
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_decoder_model_name_or_path, subfolder="unet")
+    if args.segment:
+        # Modify the UNet to accept 4-channel input (RGB + segm mask latents from VAE) and output 2 noise predictions
+        modify_unet_conv_layers(unet, new_in_channels=8, new_out_channels=8)
+        logger.info("Modified UNet to have 8 input and output channels for segmentation mask.")
 
     # Freeze vae and image_encoder
     vae.requires_grad_(False)
@@ -612,24 +672,38 @@ def main():
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-        )
+    if not args.segment:
+        if args.dataset_name is not None:
+            # Downloading and loading a dataset from the hub.
+            dataset = load_dataset(
+                args.dataset_name,
+                args.dataset_config_name,
+                cache_dir=args.cache_dir,
+            )
+        else:
+            data_files = {}
+            if args.train_data_dir is not None:
+                data_files["train"] = os.path.join(args.train_data_dir, "**")
+            dataset = load_dataset(
+                "imagefolder",
+                data_files=data_files,
+                cache_dir=args.cache_dir,
+            )
+            # See more about loading custom images at
+            # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
     else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
+        if args.train_data_dir is None:
+            raise ValueError("Need a training folder when using the segmentation mask generation mode.")
+        dataset = {}
+        dataset["train"] = PairedDataset(
+            dataset_dir=args.train_data_dir,
+            mode="train",
+            resize_size=args.resolution,
+            resizer="nearest",
+            random_flip=True,
+            normalize=True,
         )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
+        logger.info(f"Number of training examples: {len(dataset['train'])}")
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
@@ -656,8 +730,16 @@ def main():
         return img
 
     def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
+        # If segmenting, skip transforms and use images directly
+        if args.segment:
+            # images are already tensors from PairedDataset, convert to PIL for image_processor
+            images = [transforms.ToPILImage()(img) if isinstance(img, torch.Tensor) else img for img in examples[image_column]]
+            examples["pixel_values"] = [img for img in examples[image_column]]  # already processed
+        else:
+            images = [image.convert("RGB") for image in examples[image_column]]
+            examples["pixel_values"] = [train_transforms(image) for image in images]
+
+        # Always process images for CLIP
         examples["clip_pixel_values"] = image_processor(images, return_tensors="pt").pixel_values
         return examples
 
@@ -672,7 +754,12 @@ def main():
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         clip_pixel_values = torch.stack([example["clip_pixel_values"] for example in examples])
         clip_pixel_values = clip_pixel_values.to(memory_format=torch.contiguous_format).float()
-        return {"pixel_values": pixel_values, "clip_pixel_values": clip_pixel_values}
+        out_data = {"pixel_values": pixel_values, "clip_pixel_values": clip_pixel_values}
+        if "mask" in examples[0]:
+            mask_values = torch.stack([example["mask"] for example in examples])
+            mask_values = mask_values.to(memory_format=torch.contiguous_format).float()
+            out_data["mask_values"] = mask_values
+        return out_data
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -770,6 +857,10 @@ def main():
                 clip_images = batch["clip_pixel_values"].to(weight_dtype)
                 latents = vae.encode(images).latents
                 image_embeds = image_encoder(clip_images).image_embeds
+                if args.segment:
+                    masks = batch["mask_values"].to(weight_dtype)
+                    mask_latents = vae.encode(masks).latents
+                    latents = torch.cat([latents, mask_latents], dim=1)  # concatenate in channel dimension
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
@@ -784,7 +875,10 @@ def main():
                 # Predict the noise residual and compute loss
                 added_cond_kwargs = {"image_embeds": image_embeds}
 
-                model_pred = unet(noisy_latents, timesteps, None, added_cond_kwargs=added_cond_kwargs).sample[:, :4]
+                model_pred = unet(noisy_latents, timesteps, None, added_cond_kwargs=added_cond_kwargs).sample
+
+                if not args.segment:
+                    model_pred = model_pred[:, :4]  # take only the first 4 channels if predicting without segmentation
 
                 if args.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -889,11 +983,13 @@ def main():
             args.pretrained_decoder_model_name_or_path,
             vae=vae,
             unet=unet,
+            segment_flag=args.segment,
         )
         pipeline.decoder_pipe.save_pretrained(args.output_dir)
 
         # Run a final round of inference.
         images = []
+        masks = []
         if args.validation_prompts is not None:
             logger.info("Running inference for collecting generated images...")
             pipeline.torch_dtype = weight_dtype
@@ -910,8 +1006,11 @@ def main():
 
             for i in range(len(args.validation_prompts)):
                 with torch.autocast("cuda"):
-                    image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
+                    predictions = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator)
+                    image = predictions.images[0]
+                    mask = predictions.masks[0] if predictions.masks else None
                 images.append(image)
+                masks.append(mask) if mask else None
 
         if args.push_to_hub:
             save_model_card(args, repo_id, images, repo_folder=args.output_dir)

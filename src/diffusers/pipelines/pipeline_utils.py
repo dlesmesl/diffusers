@@ -120,6 +120,7 @@ class ImagePipelineOutput(BaseOutput):
     """
 
     images: Union[List[PIL.Image.Image], np.ndarray]
+    masks: Optional[Union[List[PIL.Image.Image], np.ndarray]] = None
 
 
 @dataclass

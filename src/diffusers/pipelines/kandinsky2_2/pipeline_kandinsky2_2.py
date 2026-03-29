@@ -83,6 +83,8 @@ class KandinskyV22Pipeline(DiffusionPipeline):
             Conditional U-Net architecture to denoise the image embedding.
         movq ([`VQModel`]):
             MoVQ Decoder to generate the image from the latents.
+        segment_flag (bool, *optional*, defaults to False):
+            Whether to enable segmentation during image generation.
     """
 
     model_cpu_offload_seq = "unet->movq"
@@ -93,6 +95,7 @@ class KandinskyV22Pipeline(DiffusionPipeline):
         unet: UNet2DConditionModel,
         scheduler: DDPMScheduler,
         movq: VQModel,
+        segment_flag = False
     ):
         super().__init__()
 
@@ -102,6 +105,7 @@ class KandinskyV22Pipeline(DiffusionPipeline):
             movq=movq,
         )
         self.movq_scale_factor = 2 ** (len(self.movq.config.block_out_channels) - 1)
+        self.segment_flag = segment_flag
 
     # Copied from diffusers.pipelines.unclip.pipeline_unclip.UnCLIPPipeline.prepare_latents
     def prepare_latents(self, shape, dtype, device, generator, latents, scheduler):
@@ -312,20 +316,34 @@ class KandinskyV22Pipeline(DiffusionPipeline):
 
         if not output_type == "latent":
             # post-processing
-            image = self.movq.decode(latents, force_not_quantize=True)["sample"]
+            if self.segment_flag:
+                image = self.movq.decode(latents[:, :4], force_not_quantize=True)["sample"]
+                mask = self.movq.decode(latents[:, 4:], force_not_quantize=True)["sample"]
+            else:
+                image = self.movq.decode(latents, force_not_quantize=True)["sample"]
+                mask = None
             if output_type in ["np", "pil"]:
                 image = image * 0.5 + 0.5
                 image = image.clamp(0, 1)
                 image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+                if self.segment_flag:
+                    mask = mask * 0.5 + 0.5
+                    mask = mask.clamp(0, 1)
+                    mask = mask.cpu().permute(0, 2, 3, 1).float().numpy()
 
             if output_type == "pil":
                 image = self.numpy_to_pil(image)
+                if self.segment_flag:
+                    mask = self.numpy_to_pil(mask)
         else:
-            image = latents
+            if not self.segment_flag:
+                image = latents
+            else:
+                image, mask = latents[:, :4], latents[:, 4:]
 
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (image,)
+            return (image, mask)
 
-        return ImagePipelineOutput(images=image)
+        return ImagePipelineOutput(images=image, masks=mask)
