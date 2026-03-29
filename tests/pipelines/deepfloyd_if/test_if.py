@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 HuggingFace Inc.
+# Copyright 2025 HuggingFace Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,13 +18,13 @@ import unittest
 
 import torch
 
-from diffusers import (
-    IFPipeline,
-)
+from diffusers import IFPipeline
 from diffusers.models.attention_processor import AttnAddedKVProcessor
 from diffusers.utils.import_utils import is_xformers_available
-from diffusers.utils.testing_utils import (
+
+from ...testing_utils import (
     backend_empty_cache,
+    backend_max_memory_allocated,
     backend_reset_max_memory_allocated,
     backend_reset_peak_memory_stats,
     load_numpy,
@@ -36,7 +36,6 @@ from diffusers.utils.testing_utils import (
     slow,
     torch_device,
 )
-
 from ..pipeline_params import TEXT_TO_IMAGE_BATCH_PARAMS, TEXT_TO_IMAGE_PARAMS
 from ..test_pipelines_common import PipelineTesterMixin, assert_mean_pixel_difference
 from . import IFPipelineTesterMixin
@@ -67,9 +66,6 @@ class IFPipelineFastTests(PipelineTesterMixin, IFPipelineTesterMixin, unittest.T
 
         return inputs
 
-    def test_save_load_optional_components(self):
-        self._test_save_load_optional_components()
-
     @unittest.skipIf(torch_device not in ["cuda", "xpu"], reason="float16 requires CUDA or XPU")
     @require_accelerator
     def test_save_load_float16(self):
@@ -98,6 +94,10 @@ class IFPipelineFastTests(PipelineTesterMixin, IFPipelineTesterMixin, unittest.T
     @require_transformers_version_greater("4.47.1")
     def test_save_load_dduf(self):
         super().test_save_load_dduf(atol=1e-2, rtol=1e-2)
+
+    @unittest.skip("Functionality is tested elsewhere.")
+    def test_save_load_optional_components(self):
+        pass
 
 
 @slow
@@ -134,7 +134,7 @@ class IFPipelineSlowTests(unittest.TestCase):
 
         image = output.images[0]
 
-        mem_bytes = torch.cuda.max_memory_allocated()
+        mem_bytes = backend_max_memory_allocated(torch_device)
         assert mem_bytes < 12 * 10**9
 
         expected_image = load_numpy(

@@ -3,22 +3,22 @@ import unittest
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, CLIPTextConfig, CLIPTextModel, CLIPTokenizer, T5EncoderModel
+from transformers import AutoConfig, AutoTokenizer, CLIPTextConfig, CLIPTextModel, CLIPTokenizer, T5EncoderModel
 
 from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, FluxInpaintPipeline, FluxTransformer2DModel
-from diffusers.utils.testing_utils import (
+
+from ...testing_utils import (
     enable_full_determinism,
     floats_tensor,
     torch_device,
 )
-
-from ..test_pipelines_common import PipelineTesterMixin
+from ..test_pipelines_common import FluxIPAdapterTesterMixin, PipelineTesterMixin
 
 
 enable_full_determinism()
 
 
-class FluxInpaintPipelineFastTests(unittest.TestCase, PipelineTesterMixin):
+class FluxInpaintPipelineFastTests(unittest.TestCase, PipelineTesterMixin, FluxIPAdapterTesterMixin):
     pipeline_class = FluxInpaintPipeline
     params = frozenset(["prompt", "height", "width", "guidance_scale", "prompt_embeds", "pooled_prompt_embeds"])
     batch_params = frozenset(["prompt"])
@@ -55,7 +55,8 @@ class FluxInpaintPipelineFastTests(unittest.TestCase, PipelineTesterMixin):
         text_encoder = CLIPTextModel(clip_text_encoder_config)
 
         torch.manual_seed(0)
-        text_encoder_2 = T5EncoderModel.from_pretrained("hf-internal-testing/tiny-random-t5")
+        config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-t5")
+        text_encoder_2 = T5EncoderModel(config)
 
         tokenizer = CLIPTokenizer.from_pretrained("hf-internal-testing/tiny-random-clip")
         tokenizer_2 = AutoTokenizer.from_pretrained("hf-internal-testing/tiny-random-t5")
@@ -85,6 +86,8 @@ class FluxInpaintPipelineFastTests(unittest.TestCase, PipelineTesterMixin):
             "tokenizer_2": tokenizer_2,
             "transformer": transformer,
             "vae": vae,
+            "image_encoder": None,
+            "feature_extractor": None,
         }
 
     def get_dummy_inputs(self, device, seed=0):
@@ -125,30 +128,6 @@ class FluxInpaintPipelineFastTests(unittest.TestCase, PipelineTesterMixin):
         # Outputs should be different here
         # For some reasons, they don't show large differences
         assert max_diff > 1e-6
-
-    def test_flux_inpaint_prompt_embeds(self):
-        pipe = self.pipeline_class(**self.get_dummy_components()).to(torch_device)
-        inputs = self.get_dummy_inputs(torch_device)
-
-        output_with_prompt = pipe(**inputs).images[0]
-
-        inputs = self.get_dummy_inputs(torch_device)
-        prompt = inputs.pop("prompt")
-
-        (prompt_embeds, pooled_prompt_embeds, text_ids) = pipe.encode_prompt(
-            prompt,
-            prompt_2=None,
-            device=torch_device,
-            max_sequence_length=inputs["max_sequence_length"],
-        )
-        output_with_embeds = pipe(
-            prompt_embeds=prompt_embeds,
-            pooled_prompt_embeds=pooled_prompt_embeds,
-            **inputs,
-        ).images[0]
-
-        max_diff = np.abs(output_with_prompt - output_with_embeds).max()
-        assert max_diff < 1e-4
 
     def test_flux_image_output_shape(self):
         pipe = self.pipeline_class(**self.get_dummy_components()).to(torch_device)

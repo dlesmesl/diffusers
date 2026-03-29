@@ -19,7 +19,8 @@ from diffusers import (
 )
 from diffusers.models.attention import FreeNoiseTransformerBlock
 from diffusers.utils import is_xformers_available, logging
-from diffusers.utils.testing_utils import (
+
+from ...testing_utils import (
     backend_empty_cache,
     numpy_cosine_similarity_distance,
     require_accelerator,
@@ -27,7 +28,6 @@ from diffusers.utils.testing_utils import (
     slow,
     torch_device,
 )
-
 from ..pipeline_params import TEXT_TO_IMAGE_BATCH_PARAMS, TEXT_TO_IMAGE_PARAMS
 from ..test_pipelines_common import (
     IPAdapterTesterMixin,
@@ -547,6 +547,14 @@ class AnimateDiffPipelineFastTests(
 
     def test_vae_slicing(self):
         return super().test_vae_slicing(image_count=2)
+
+    def test_encode_prompt_works_in_isolation(self):
+        extra_required_param_value_dict = {
+            "device": torch.device(torch_device).type,
+            "num_images_per_prompt": 1,
+            "do_classifier_free_guidance": self.get_dummy_inputs(device=torch_device).get("guidance_scale", 1.0) > 1.0,
+        }
+        return super().test_encode_prompt_works_in_isolation(extra_required_param_value_dict)
 
 
 @slow

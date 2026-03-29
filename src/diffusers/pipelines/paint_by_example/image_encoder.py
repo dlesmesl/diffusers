@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,6 +34,8 @@ class PaintByExampleImageEncoder(CLIPPreTrainedModel):
 
         # uncondition for scaling
         self.uncond_vector = nn.Parameter(torch.randn((1, 1, self.proj_size)))
+
+        self.post_init()
 
     def forward(self, pixel_values, return_uncond_vector=False):
         clip_output = self.model(pixel_values=pixel_values)

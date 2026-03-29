@@ -1,4 +1,4 @@
-<!--Copyright 2024 The HuggingFace Team. All rights reserved.
+<!--Copyright 2025 The HuggingFace Team. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
 the License. You may obtain a copy of the License at
@@ -566,3 +566,15 @@ $ git push --set-upstream origin your-branch-for-syncing
 ### Style guide
 
 For documentation strings, 🧨 Diffusers follows the [Google style](https://google.github.io/styleguide/pyguide.html).
+
+
+## Coding with AI agents
+
+The repository keeps AI-agent configuration in `.ai/` and exposes local agent files via symlinks.
+
+- **Source of truth** — edit files under `.ai/` (`AGENTS.md` for coding guidelines, `skills/` for on-demand task knowledge)
+- **Don't edit** generated root-level `AGENTS.md`, `CLAUDE.md`, or `.agents/skills`/`.claude/skills` — they are symlinks
+- Setup commands:
+  - `make codex` — symlink guidelines + skills for OpenAI Codex
+  - `make claude` — symlink guidelines + skills for Claude Code
+  - `make clean-ai` — remove all generated symlinks

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import unittest
 from typing import List
 
 import numpy as np
+from parameterized import parameterized
 from transformers import AutoTokenizer, CLIPTextModel, CLIPTokenizer, T5EncoderModel
 
 from diffusers import (
@@ -29,107 +30,106 @@ from diffusers import (
     TorchAoConfig,
 )
 from diffusers.models.attention_processor import Attention
-from diffusers.utils.testing_utils import (
+from diffusers.quantizers import PipelineQuantizationConfig
+
+from ...testing_utils import (
+    Expectations,
+    backend_empty_cache,
+    backend_synchronize,
     enable_full_determinism,
     is_torch_available,
     is_torchao_available,
     nightly,
+    numpy_cosine_similarity_distance,
     require_torch,
-    require_torch_gpu,
+    require_torch_accelerator,
     require_torchao_version_greater_or_equal,
     slow,
     torch_device,
 )
+from ..test_torch_compile_utils import QuantCompileTests
 
 
 enable_full_determinism()
+
+
+def _is_xpu_or_cuda_capability_atleast_8_9() -> bool:
+    if is_torch_available():
+        import torch
+
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            if major == 8:
+                return minor >= 9
+            return major >= 9
+        elif torch.xpu.is_available():
+            return True
+    return False
 
 
 if is_torch_available():
     import torch
     import torch.nn as nn
 
-    class LoRALayer(nn.Module):
-        """Wraps a linear layer with LoRA-like adapter - Used for testing purposes only
-
-        Taken from
-        https://github.com/huggingface/transformers/blob/566302686a71de14125717dea9a6a45b24d42b37/tests/quantization/bnb/test_4bit.py#L62C5-L78C77
-        """
-
-        def __init__(self, module: nn.Module, rank: int):
-            super().__init__()
-            self.module = module
-            self.adapter = nn.Sequential(
-                nn.Linear(module.in_features, rank, bias=False),
-                nn.Linear(rank, module.out_features, bias=False),
-            )
-            small_std = (2.0 / (5 * min(module.in_features, module.out_features))) ** 0.5
-            nn.init.normal_(self.adapter[0].weight, std=small_std)
-            nn.init.zeros_(self.adapter[1].weight)
-            self.adapter.to(module.weight.device)
-
-        def forward(self, input, *args, **kwargs):
-            return self.module(input, *args, **kwargs) + self.adapter(input)
+    from ..utils import LoRALayer, get_memory_consumption_stat
 
 
 if is_torchao_available():
     from torchao.dtypes import AffineQuantizedTensor
+    from torchao.quantization import (
+        Float8WeightOnlyConfig,
+        Int4WeightOnlyConfig,
+        Int8DynamicActivationInt8WeightConfig,
+        Int8DynamicActivationIntxWeightConfig,
+        Int8WeightOnlyConfig,
+        IntxWeightOnlyConfig,
+    )
     from torchao.quantization.linear_activation_quantized_tensor import LinearActivationQuantizedTensor
     from torchao.utils import get_model_size_in_bytes
 
 
 @require_torch
-@require_torch_gpu
-@require_torchao_version_greater_or_equal("0.7.0")
+@require_torch_accelerator
+@require_torchao_version_greater_or_equal("0.15.0")
 class TorchAoConfigTest(unittest.TestCase):
     def test_to_dict(self):
         """
         Makes sure the config format is properly set
         """
-        quantization_config = TorchAoConfig("int4_weight_only")
+        quantization_config = TorchAoConfig(Int4WeightOnlyConfig(version=2))
         torchao_orig_config = quantization_config.to_dict()
-
-        for key in torchao_orig_config:
-            self.assertEqual(getattr(quantization_config, key), torchao_orig_config[key])
+        self.assertIn("quant_type", torchao_orig_config)
+        self.assertIn("quant_method", torchao_orig_config)
 
     def test_post_init_check(self):
         """
-        Test kwargs validations in TorchAoConfig
+        Test that non-AOBaseConfig types are rejected
         """
-        _ = TorchAoConfig("int4_weight_only")
-        with self.assertRaisesRegex(ValueError, "is not supported yet"):
-            _ = TorchAoConfig("uint8")
+        _ = TorchAoConfig(Int4WeightOnlyConfig())
+        with self.assertRaises(TypeError):
+            _ = TorchAoConfig("int4_weight_only")
 
-        with self.assertRaisesRegex(ValueError, "does not support the following keyword arguments"):
-            _ = TorchAoConfig("int4_weight_only", group_size1=32)
+        with self.assertRaises(TypeError):
+            _ = TorchAoConfig(42)
 
     def test_repr(self):
         """
         Check that there is no error in the repr
         """
-        quantization_config = TorchAoConfig("int4_weight_only", modules_to_not_convert=["conv"], group_size=8)
-        expected_repr = """TorchAoConfig {
-            "modules_to_not_convert": [
-                "conv"
-            ],
-            "quant_method": "torchao",
-            "quant_type": "int4_weight_only",
-            "quant_type_kwargs": {
-                "group_size": 8
-            }
-        }""".replace(" ", "").replace("\n", "")
-        quantization_repr = repr(quantization_config).replace(" ", "").replace("\n", "")
-        self.assertEqual(quantization_repr, expected_repr)
+        quantization_config = TorchAoConfig(Int8WeightOnlyConfig(version=2), modules_to_not_convert=["conv"])
+        quantization_repr = repr(quantization_config)
+        self.assertIn("TorchAoConfig", quantization_repr)
+        self.assertIn("torchao", quantization_repr)
 
 
 # Slices for these tests have been obtained on our aws-g6e-xlarge-plus runners
 @require_torch
-@require_torch_gpu
-@require_torchao_version_greater_or_equal("0.7.0")
+@require_torch_accelerator
+@require_torchao_version_greater_or_equal("0.15.0")
 class TorchAoTest(unittest.TestCase):
     def tearDown(self):
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def get_dummy_components(
         self, quantization_config: TorchAoConfig, model_id: str = "hf-internal-testing/tiny-flux-pipe"
@@ -227,53 +227,36 @@ class TorchAoTest(unittest.TestCase):
         for model_id in ["hf-internal-testing/tiny-flux-pipe", "hf-internal-testing/tiny-flux-sharded"]:
             # fmt: off
             QUANTIZATION_TYPES_TO_TEST = [
-                ("int4wo", np.array([0.4648, 0.5234, 0.5547, 0.4219, 0.4414, 0.6445, 0.4336, 0.4531, 0.5625])),
-                ("int4dq", np.array([0.4688, 0.5195, 0.5547, 0.418, 0.4414, 0.6406, 0.4336, 0.4531, 0.5625])),
-                ("int8wo", np.array([0.4648, 0.5195, 0.5547, 0.4199, 0.4414, 0.6445, 0.4316, 0.4531, 0.5625])),
-                ("int8dq", np.array([0.4648, 0.5195, 0.5547, 0.4199, 0.4414, 0.6445, 0.4316, 0.4531, 0.5625])),
-                ("uint4wo", np.array([0.4609, 0.5234, 0.5508, 0.4199, 0.4336, 0.6406, 0.4316, 0.4531, 0.5625])),
-                ("uint7wo", np.array([0.4648, 0.5195, 0.5547, 0.4219, 0.4414, 0.6445, 0.4316, 0.4531, 0.5625])),
+                (Int4WeightOnlyConfig(version=2), np.array([0.4648, 0.5234, 0.5547, 0.4219, 0.4414, 0.6445, 0.4336, 0.4531, 0.5625])),
+                (Int8DynamicActivationIntxWeightConfig(version=2), np.array([0.4688, 0.5195, 0.5547, 0.418, 0.4414, 0.6406, 0.4336, 0.4531, 0.5625])),
+                (Int8WeightOnlyConfig(version=2), np.array([0.4648, 0.5195, 0.5547, 0.4199, 0.4414, 0.6445, 0.4316, 0.4531, 0.5625])),
+                (Int8DynamicActivationInt8WeightConfig(version=2), np.array([0.4648, 0.5195, 0.5547, 0.4199, 0.4414, 0.6445, 0.4316, 0.4531, 0.5625])),
+                (IntxWeightOnlyConfig(dtype=torch.uint4, group_size=16, version=2), np.array([0.4609, 0.5234, 0.5508, 0.4199, 0.4336, 0.6406, 0.4316, 0.4531, 0.5625])),
+                (IntxWeightOnlyConfig(dtype=torch.uint7, group_size=16, version=2), np.array([0.4648, 0.5195, 0.5547, 0.4219, 0.4414, 0.6445, 0.4316, 0.4531, 0.5625])),
             ]
 
-            if TorchAoConfig._is_cuda_capability_atleast_8_9():
+            if _is_xpu_or_cuda_capability_atleast_8_9():
                 QUANTIZATION_TYPES_TO_TEST.extend([
-                    ("float8wo_e5m2", np.array([0.4590, 0.5273, 0.5547, 0.4219, 0.4375, 0.6406, 0.4316, 0.4512, 0.5625])),
-                    ("float8wo_e4m3", np.array([0.4648, 0.5234, 0.5547, 0.4219, 0.4414, 0.6406, 0.4316, 0.4531, 0.5625])),
-                    # =====
-                    # The following lead to an internal torch error:
-                    #    RuntimeError: mat2 shape (32x4 must be divisible by 16
-                    # Skip these for now; TODO(aryan): investigate later
-                    # ("float8dq_e4m3", np.array([0, 0, 0, 0, 0, 0, 0, 0, 0])),
-                    # ("float8dq_e4m3_tensor", np.array([0, 0, 0, 0, 0, 0, 0, 0, 0])),
-                    # =====
-                    # Cutlass fails to initialize for below
-                    # ("float8dq_e4m3_row", np.array([0, 0, 0, 0, 0, 0, 0, 0, 0])),
-                    # =====
-                    ("fp4", np.array([0.4668, 0.5195, 0.5547, 0.4199, 0.4434, 0.6445, 0.4316, 0.4531, 0.5625])),
-                    ("fp6", np.array([0.4668, 0.5195, 0.5547, 0.4199, 0.4434, 0.6445, 0.4316, 0.4531, 0.5625])),
+                    (Float8WeightOnlyConfig(weight_dtype=torch.float8_e5m2), np.array([0.4590, 0.5273, 0.5547, 0.4219, 0.4375, 0.6406, 0.4316, 0.4512, 0.5625])),
+                    (Float8WeightOnlyConfig(weight_dtype=torch.float8_e4m3fn), np.array([0.4648, 0.5234, 0.5547, 0.4219, 0.4414, 0.6406, 0.4316, 0.4531, 0.5625])),
                 ])
             # fmt: on
 
-            for quantization_name, expected_slice in QUANTIZATION_TYPES_TO_TEST:
-                quant_kwargs = {}
-                if quantization_name in ["uint4wo", "uint7wo"]:
-                    # The dummy flux model that we use has smaller dimensions. This imposes some restrictions on group_size here
-                    quant_kwargs.update({"group_size": 16})
-                quantization_config = TorchAoConfig(
-                    quant_type=quantization_name, modules_to_not_convert=["x_embedder"], **quant_kwargs
-                )
+            for quant_config, expected_slice in QUANTIZATION_TYPES_TO_TEST:
+                quantization_config = TorchAoConfig(quant_type=quant_config, modules_to_not_convert=["x_embedder"])
                 self._test_quant_type(quantization_config, expected_slice, model_id)
 
     def test_int4wo_quant_bfloat16_conversion(self):
         """
         Tests whether the dtype of model will be modified to bfloat16 for int4 weight-only quantization.
         """
-        quantization_config = TorchAoConfig("int4_weight_only", group_size=64)
+        quantization_config = TorchAoConfig(Int4WeightOnlyConfig(group_size=64))
         quantized_model = FluxTransformer2DModel.from_pretrained(
             "hf-internal-testing/tiny-flux-pipe",
             subfolder="transformer",
             quantization_config=quantization_config,
             torch_dtype=torch.bfloat16,
+            device_map=f"{torch_device}:0",
         )
 
         weight = quantized_model.transformer_blocks[0].ff.net[2].weight
@@ -282,9 +265,6 @@ class TorchAoTest(unittest.TestCase):
         self.assertEqual(weight.quant_max, 15)
 
     def test_device_map(self):
-        # Note: We were not checking if the weight tensor's were AffineQuantizedTensor's before. If we did
-        # it would have errored out. Now, we do. So, device_map basically never worked with or without
-        # sharded checkpoints. This will need to be supported in the future (TODO(aryan))
         """
         Test if the quantized model int4 weight-only is working properly with "auto" and custom device maps.
         The custom device map performs cpu/disk offloading as well. Also verifies that the device map is
@@ -301,57 +281,76 @@ class TorchAoTest(unittest.TestCase):
         }
         device_maps = ["auto", custom_device_map_dict]
 
-        # inputs = self.get_dummy_tensor_inputs(torch_device)
-        # expected_slice = np.array([0.3457, -0.0366, 0.0105, -0.2275, -0.4941, 0.4395, -0.166, -0.6641, 0.4375])
-
+        inputs = self.get_dummy_tensor_inputs(torch_device)
+        # requires with different expected slices since models are different due to offload (we don't quantize modules offloaded to cpu/disk)
+        expected_slice_auto = np.array(
+            [
+                0.34179688,
+                -0.03613281,
+                0.01428223,
+                -0.22949219,
+                -0.49609375,
+                0.4375,
+                -0.1640625,
+                -0.66015625,
+                0.43164062,
+            ]
+        )
+        expected_slice_offload = np.array(
+            [0.34375, -0.03515625, 0.0123291, -0.22753906, -0.49414062, 0.4375, -0.16308594, -0.66015625, 0.43554688]
+        )
         for device_map in device_maps:
-            # device_map_to_compare = {"": 0} if device_map == "auto" else device_map
+            if device_map == "auto":
+                expected_slice = expected_slice_auto
+            else:
+                expected_slice = expected_slice_offload
+            with tempfile.TemporaryDirectory() as offload_folder:
+                quantization_config = TorchAoConfig(Int4WeightOnlyConfig(group_size=64))
+                quantized_model = FluxTransformer2DModel.from_pretrained(
+                    "hf-internal-testing/tiny-flux-pipe",
+                    subfolder="transformer",
+                    quantization_config=quantization_config,
+                    device_map=device_map,
+                    torch_dtype=torch.bfloat16,
+                    offload_folder=offload_folder,
+                )
 
-            # Test non-sharded model - should work
-            with self.assertRaises(NotImplementedError):
-                with tempfile.TemporaryDirectory() as offload_folder:
-                    quantization_config = TorchAoConfig("int4_weight_only", group_size=64)
-                    _ = FluxTransformer2DModel.from_pretrained(
-                        "hf-internal-testing/tiny-flux-pipe",
-                        subfolder="transformer",
-                        quantization_config=quantization_config,
-                        device_map=device_map,
-                        torch_dtype=torch.bfloat16,
-                        offload_folder=offload_folder,
-                    )
+                weight = quantized_model.transformer_blocks[0].ff.net[2].weight
 
-                    # weight = quantized_model.transformer_blocks[0].ff.net[2].weight
-                    # self.assertTrue(quantized_model.hf_device_map == device_map_to_compare)
-                    # self.assertTrue(isinstance(weight, AffineQuantizedTensor))
+                # Note that when performing cpu/disk offload, the offloaded weights are not quantized, only the weights on the gpu.
+                # This is not the case when the model are already quantized
+                if "transformer_blocks.0" in device_map:
+                    self.assertTrue(isinstance(weight, nn.Parameter))
+                else:
+                    self.assertTrue(isinstance(weight, AffineQuantizedTensor))
 
-                    # output = quantized_model(**inputs)[0]
-                    # output_slice = output.flatten()[-9:].detach().float().cpu().numpy()
-                    # self.assertTrue(np.allclose(output_slice, expected_slice, atol=1e-3, rtol=1e-3))
+                output = quantized_model(**inputs)[0]
+                output_slice = output.flatten()[-9:].detach().float().cpu().numpy()
+                self.assertTrue(numpy_cosine_similarity_distance(output_slice, expected_slice) < 2e-3)
 
-            # Test sharded model - should not work
-            with self.assertRaises(NotImplementedError):
-                with tempfile.TemporaryDirectory() as offload_folder:
-                    quantization_config = TorchAoConfig("int4_weight_only", group_size=64)
-                    _ = FluxTransformer2DModel.from_pretrained(
-                        "hf-internal-testing/tiny-flux-sharded",
-                        subfolder="transformer",
-                        quantization_config=quantization_config,
-                        device_map=device_map,
-                        torch_dtype=torch.bfloat16,
-                        offload_folder=offload_folder,
-                    )
+            with tempfile.TemporaryDirectory() as offload_folder:
+                quantization_config = TorchAoConfig(Int4WeightOnlyConfig(group_size=64))
+                quantized_model = FluxTransformer2DModel.from_pretrained(
+                    "hf-internal-testing/tiny-flux-sharded",
+                    subfolder="transformer",
+                    quantization_config=quantization_config,
+                    device_map=device_map,
+                    torch_dtype=torch.bfloat16,
+                    offload_folder=offload_folder,
+                )
 
-                    # weight = quantized_model.transformer_blocks[0].ff.net[2].weight
-                    # self.assertTrue(quantized_model.hf_device_map == device_map_to_compare)
-                    # self.assertTrue(isinstance(weight, AffineQuantizedTensor))
+                weight = quantized_model.transformer_blocks[0].ff.net[2].weight
+                if "transformer_blocks.0" in device_map:
+                    self.assertTrue(isinstance(weight, nn.Parameter))
+                else:
+                    self.assertTrue(isinstance(weight, AffineQuantizedTensor))
 
-                    # output = quantized_model(**inputs)[0]
-                    # output_slice = output.flatten()[-9:].detach().float().cpu().numpy()
-
-                    # self.assertTrue(np.allclose(output_slice, expected_slice, atol=1e-3, rtol=1e-3))
+                output = quantized_model(**inputs)[0]
+                output_slice = output.flatten()[-9:].detach().float().cpu().numpy()
+                self.assertTrue(numpy_cosine_similarity_distance(output_slice, expected_slice) < 2e-3)
 
     def test_modules_to_not_convert(self):
-        quantization_config = TorchAoConfig("int8_weight_only", modules_to_not_convert=["transformer_blocks.0"])
+        quantization_config = TorchAoConfig(Int8WeightOnlyConfig(), modules_to_not_convert=["transformer_blocks.0"])
         quantized_model_with_not_convert = FluxTransformer2DModel.from_pretrained(
             "hf-internal-testing/tiny-flux-pipe",
             subfolder="transformer",
@@ -367,7 +366,7 @@ class TorchAoTest(unittest.TestCase):
         quantized_layer = quantized_model_with_not_convert.proj_out
         self.assertTrue(isinstance(quantized_layer.weight, AffineQuantizedTensor))
 
-        quantization_config = TorchAoConfig("int8_weight_only")
+        quantization_config = TorchAoConfig(Int8WeightOnlyConfig())
         quantized_model = FluxTransformer2DModel.from_pretrained(
             "hf-internal-testing/tiny-flux-pipe",
             subfolder="transformer",
@@ -381,7 +380,7 @@ class TorchAoTest(unittest.TestCase):
         self.assertTrue(size_quantized < size_quantized_with_not_convert)
 
     def test_training(self):
-        quantization_config = TorchAoConfig("int8_weight_only")
+        quantization_config = TorchAoConfig(Int8WeightOnlyConfig())
         quantized_model = FluxTransformer2DModel.from_pretrained(
             "hf-internal-testing/tiny-flux-pipe",
             subfolder="transformer",
@@ -415,7 +414,7 @@ class TorchAoTest(unittest.TestCase):
     def test_torch_compile(self):
         r"""Test that verifies if torch.compile works with torchao quantization."""
         for model_id in ["hf-internal-testing/tiny-flux-pipe", "hf-internal-testing/tiny-flux-sharded"]:
-            quantization_config = TorchAoConfig("int8_weight_only")
+            quantization_config = TorchAoConfig(Int8WeightOnlyConfig())
             components = self.get_dummy_components(quantization_config, model_id=model_id)
             pipe = FluxPipeline(**components)
             pipe.to(device=torch_device)
@@ -436,11 +435,15 @@ class TorchAoTest(unittest.TestCase):
         memory footprint of the converted model and the class type of the linear layers of the converted models
         """
         for model_id in ["hf-internal-testing/tiny-flux-pipe", "hf-internal-testing/tiny-flux-sharded"]:
-            transformer_int4wo = self.get_dummy_components(TorchAoConfig("int4wo"), model_id=model_id)["transformer"]
+            transformer_int4wo = self.get_dummy_components(TorchAoConfig(Int4WeightOnlyConfig()), model_id=model_id)[
+                "transformer"
+            ]
             transformer_int4wo_gs32 = self.get_dummy_components(
-                TorchAoConfig("int4wo", group_size=32), model_id=model_id
+                TorchAoConfig(Int4WeightOnlyConfig(group_size=32)), model_id=model_id
             )["transformer"]
-            transformer_int8wo = self.get_dummy_components(TorchAoConfig("int8wo"), model_id=model_id)["transformer"]
+            transformer_int8wo = self.get_dummy_components(TorchAoConfig(Int8WeightOnlyConfig()), model_id=model_id)[
+                "transformer"
+            ]
             transformer_bf16 = self.get_dummy_components(None, model_id=model_id)["transformer"]
 
             # Will not quantized all the layers by default due to the model weights shapes not being divisible by group_size=64
@@ -472,15 +475,48 @@ class TorchAoTest(unittest.TestCase):
             # there is additional overhead of scales and zero points
             self.assertTrue(total_bf16 < total_int4wo)
 
+    def test_model_memory_usage(self):
+        model_id = "hf-internal-testing/tiny-flux-pipe"
+        expected_memory_saving_ratios = Expectations(
+            {
+                # XPU: For this tiny model, per-tensor overheads (alignment, fragmentation, metadata) become visible.
+                # While XPU doesn't have the large fixed cuBLAS workspace of A100, these small overheads prevent reaching the ideal 2.0 ratio.
+                # Observed ~1.27x (158k vs 124k) for model size.
+                # The runtime memory overhead is ~88k for both bf16 and int8wo. Adding this to model size: (158k+88k)/(124k+88k) ≈ 1.15.
+                ("xpu", None): 1.15,
+                # On Ampere, the cuBLAS kernels used for matrix multiplication often allocate a fixed-size workspace.
+                # Since the tiny-flux model weights are likely smaller than or comparable to this workspace, the total memory is dominated by the workspace.
+                ("cuda", 8): 1.02,
+                # On Hopper, TorchAO utilizes newer, highly optimized kernels (via Triton or CUTLASS 3.x) that are designed to be workspace-free or use negligible extra memory.
+                # Additionally, Triton kernels often handle unaligned memory better, avoiding the padding overhead seen on other backends for tiny tensors.
+                # This allows it to achieve the near-ideal 2.0x compression ratio.
+                ("cuda", 9): 2.0,
+            }
+        )
+        expected_memory_saving_ratio = expected_memory_saving_ratios.get_expectation()
+        inputs = self.get_dummy_tensor_inputs(device=torch_device)
+
+        transformer_bf16 = self.get_dummy_components(None, model_id=model_id)["transformer"]
+        transformer_bf16.to(torch_device)
+        unquantized_model_memory = get_memory_consumption_stat(transformer_bf16, inputs)
+        del transformer_bf16
+
+        transformer_int8wo = self.get_dummy_components(TorchAoConfig(Int8WeightOnlyConfig()), model_id=model_id)[
+            "transformer"
+        ]
+        transformer_int8wo.to(torch_device)
+        quantized_model_memory = get_memory_consumption_stat(transformer_int8wo, inputs)
+        assert unquantized_model_memory / quantized_model_memory >= expected_memory_saving_ratio
+
     def test_wrong_config(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaises(TypeError):
             self.get_dummy_components(TorchAoConfig("int42"))
 
     def test_sequential_cpu_offload(self):
         r"""
         A test that checks if inference runs as expected when sequential cpu offloading is enabled.
         """
-        quantization_config = TorchAoConfig("int8wo")
+        quantization_config = TorchAoConfig(Int8WeightOnlyConfig())
         components = self.get_dummy_components(quantization_config)
         pipe = FluxPipeline(**components)
         pipe.enable_sequential_cpu_offload()
@@ -488,20 +524,29 @@ class TorchAoTest(unittest.TestCase):
         inputs = self.get_dummy_inputs(torch_device)
         _ = pipe(**inputs)
 
+    @require_torchao_version_greater_or_equal("0.15.0")
+    def test_aobase_config(self):
+        quantization_config = TorchAoConfig(Int8WeightOnlyConfig())
+        components = self.get_dummy_components(quantization_config)
+        pipe = FluxPipeline(**components).to(torch_device)
+
+        inputs = self.get_dummy_inputs(torch_device)
+        _ = pipe(**inputs)
+
 
 # Slices for these tests have been obtained on our aws-g6e-xlarge-plus runners
 @require_torch
-@require_torch_gpu
-@require_torchao_version_greater_or_equal("0.7.0")
+@require_torch_accelerator
+@require_torchao_version_greater_or_equal("0.15.0")
 class TorchAoSerializationTest(unittest.TestCase):
     model_name = "hf-internal-testing/tiny-flux-pipe"
 
     def tearDown(self):
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
-    def get_dummy_model(self, quant_method, quant_method_kwargs, device=None):
-        quantization_config = TorchAoConfig(quant_method, **quant_method_kwargs)
+    def get_dummy_model(self, quant_type, device=None):
+        quantization_config = TorchAoConfig(quant_type)
         quantized_model = FluxTransformer2DModel.from_pretrained(
             self.model_name,
             subfolder="transformer",
@@ -537,17 +582,17 @@ class TorchAoSerializationTest(unittest.TestCase):
             "timestep": timestep,
         }
 
-    def _test_original_model_expected_slice(self, quant_method, quant_method_kwargs, expected_slice):
-        quantized_model = self.get_dummy_model(quant_method, quant_method_kwargs, torch_device)
+    def _test_original_model_expected_slice(self, quant_type, expected_slice):
+        quantized_model = self.get_dummy_model(quant_type, torch_device)
         inputs = self.get_dummy_tensor_inputs(torch_device)
         output = quantized_model(**inputs)[0]
         output_slice = output.flatten()[-9:].detach().float().cpu().numpy()
         weight = quantized_model.transformer_blocks[0].ff.net[2].weight
         self.assertTrue(isinstance(weight, (AffineQuantizedTensor, LinearActivationQuantizedTensor)))
-        self.assertTrue(np.allclose(output_slice, expected_slice, atol=1e-3, rtol=1e-3))
+        self.assertTrue(numpy_cosine_similarity_distance(output_slice, expected_slice) < 1e-3)
 
-    def _check_serialization_expected_slice(self, quant_method, quant_method_kwargs, expected_slice, device):
-        quantized_model = self.get_dummy_model(quant_method, quant_method_kwargs, device)
+    def _check_serialization_expected_slice(self, quant_type, expected_slice, device):
+        quantized_model = self.get_dummy_model(quant_type, device)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             quantized_model.save_pretrained(tmp_dir, safe_serialization=False)
@@ -564,47 +609,97 @@ class TorchAoSerializationTest(unittest.TestCase):
                 loaded_quantized_model.proj_out.weight, (AffineQuantizedTensor, LinearActivationQuantizedTensor)
             )
         )
-        self.assertTrue(np.allclose(output_slice, expected_slice, atol=1e-3, rtol=1e-3))
+        self.assertTrue(numpy_cosine_similarity_distance(output_slice, expected_slice) < 1e-3)
 
-    def test_int_a8w8_cuda(self):
-        quant_method, quant_method_kwargs = "int8_dynamic_activation_int8_weight", {}
+    def test_int_a8w8_accelerator(self):
+        quant_type = Int8DynamicActivationInt8WeightConfig()
         expected_slice = np.array([0.3633, -0.1357, -0.0188, -0.249, -0.4688, 0.5078, -0.1289, -0.6914, 0.4551])
-        device = "cuda"
-        self._test_original_model_expected_slice(quant_method, quant_method_kwargs, expected_slice)
-        self._check_serialization_expected_slice(quant_method, quant_method_kwargs, expected_slice, device)
+        device = torch_device
+        self._test_original_model_expected_slice(quant_type, expected_slice)
+        self._check_serialization_expected_slice(quant_type, expected_slice, device)
 
-    def test_int_a16w8_cuda(self):
-        quant_method, quant_method_kwargs = "int8_weight_only", {}
+    def test_int_a16w8_accelerator(self):
+        quant_type = Int8WeightOnlyConfig()
         expected_slice = np.array([0.3613, -0.127, -0.0223, -0.2539, -0.459, 0.4961, -0.1357, -0.6992, 0.4551])
-        device = "cuda"
-        self._test_original_model_expected_slice(quant_method, quant_method_kwargs, expected_slice)
-        self._check_serialization_expected_slice(quant_method, quant_method_kwargs, expected_slice, device)
+        device = torch_device
+        self._test_original_model_expected_slice(quant_type, expected_slice)
+        self._check_serialization_expected_slice(quant_type, expected_slice, device)
 
     def test_int_a8w8_cpu(self):
-        quant_method, quant_method_kwargs = "int8_dynamic_activation_int8_weight", {}
+        quant_type = Int8DynamicActivationInt8WeightConfig()
         expected_slice = np.array([0.3633, -0.1357, -0.0188, -0.249, -0.4688, 0.5078, -0.1289, -0.6914, 0.4551])
         device = "cpu"
-        self._test_original_model_expected_slice(quant_method, quant_method_kwargs, expected_slice)
-        self._check_serialization_expected_slice(quant_method, quant_method_kwargs, expected_slice, device)
+        self._test_original_model_expected_slice(quant_type, expected_slice)
+        self._check_serialization_expected_slice(quant_type, expected_slice, device)
 
     def test_int_a16w8_cpu(self):
-        quant_method, quant_method_kwargs = "int8_weight_only", {}
+        quant_type = Int8WeightOnlyConfig()
         expected_slice = np.array([0.3613, -0.127, -0.0223, -0.2539, -0.459, 0.4961, -0.1357, -0.6992, 0.4551])
         device = "cpu"
-        self._test_original_model_expected_slice(quant_method, quant_method_kwargs, expected_slice)
-        self._check_serialization_expected_slice(quant_method, quant_method_kwargs, expected_slice, device)
+        self._test_original_model_expected_slice(quant_type, expected_slice)
+        self._check_serialization_expected_slice(quant_type, expected_slice, device)
+
+    def test_aobase_config(self):
+        quant_type = Int8WeightOnlyConfig()
+        expected_slice = np.array([0.3613, -0.127, -0.0223, -0.2539, -0.459, 0.4961, -0.1357, -0.6992, 0.4551])
+        device = torch_device
+        self._test_original_model_expected_slice(quant_type, expected_slice)
+        self._check_serialization_expected_slice(quant_type, expected_slice, device)
+
+
+@require_torchao_version_greater_or_equal("0.15.0")
+class TorchAoCompileTest(QuantCompileTests, unittest.TestCase):
+    @property
+    def quantization_config(self):
+        return PipelineQuantizationConfig(
+            quant_mapping={"transformer": TorchAoConfig(Int8WeightOnlyConfig())},
+        )
+
+    def test_torch_compile_with_cpu_offload(self):
+        pipe = self._init_pipeline(self.quantization_config, torch.bfloat16)
+        pipe.enable_model_cpu_offload()
+        # No compilation because it fails with:
+        # RuntimeError: _apply(): Couldn't swap Linear.weight
+
+        # small resolutions to ensure speedy execution.
+        pipe("a dog", num_inference_steps=2, max_sequence_length=16, height=256, width=256)
+
+    @parameterized.expand([False, True])
+    @unittest.skip(
+        """
+        For `use_stream=False`:
+            - Changing the device of AQT tensor, with `param.data = param.data.to(device)` as done in group offloading implementation
+            is unsupported in TorchAO. When compiling, FakeTensor device mismatch causes failure.
+        For `use_stream=True`:
+            Using non-default stream requires ability to pin tensors. AQT does not seem to support this yet in TorchAO.
+        """
+    )
+    def test_torch_compile_with_group_offload_leaf(self, use_stream):
+        # For use_stream=False:
+        # If we run group offloading without compilation, we will see:
+        #   RuntimeError: Attempted to set the storage of a tensor on device "cpu" to a storage on different device "cuda:0".  This is no longer allowed; the devices must match.
+        # When running with compilation, the error ends up being different:
+        #   Dynamo failed to run FX node with fake tensors: call_function <built-in function linear>(*(FakeTensor(..., device='cuda:0', size=(s0, 256), dtype=torch.bfloat16), AffineQuantizedTensor(tensor_impl=PlainAQTTensorImpl(data=FakeTensor(..., size=(1536, 256), dtype=torch.int8)... , scale=FakeTensor(..., size=(1536,), dtype=torch.bfloat16)... , zero_point=FakeTensor(..., size=(1536,), dtype=torch.int64)... , _layout=PlainLayout()), block_size=(1, 256), shape=torch.Size([1536, 256]), device=cpu, dtype=torch.bfloat16, requires_grad=False), Parameter(FakeTensor(..., device='cuda:0', size=(1536,), dtype=torch.bfloat16,
+        #   requires_grad=True))), **{}): got RuntimeError('Unhandled FakeTensor Device Propagation for aten.mm.default, found two different devices cuda:0, cpu')
+        # Looks like something that will have to be looked into upstream.
+        # for linear layers, weight.tensor_impl shows cuda... but:
+        # weight.tensor_impl.{data,scale,zero_point}.device will be cpu
+
+        # For use_stream=True:
+        # NotImplementedError: AffineQuantizedTensor dispatch: attempting to run unimplemented operator/function: func=<OpOverload(op='aten.is_pinned', overload='default')>, types=(<class 'torchao.dtypes.affine_quantized_tensor.AffineQuantizedTensor'>,), arg_types=(<class 'torchao.dtypes.affine_quantized_tensor.AffineQuantizedTensor'>,), kwarg_types={}
+        super()._test_torch_compile_with_group_offload_leaf(use_stream=use_stream)
 
 
 # Slices for these tests have been obtained on our aws-g6e-xlarge-plus runners
 @require_torch
-@require_torch_gpu
-@require_torchao_version_greater_or_equal("0.7.0")
+@require_torch_accelerator
+@require_torchao_version_greater_or_equal("0.15.0")
 @slow
 @nightly
 class SlowTorchAoTests(unittest.TestCase):
     def tearDown(self):
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def get_dummy_components(self, quantization_config: TorchAoConfig):
         # This is just for convenience, so that we can modify it at one place for custom environments and locally testing
@@ -671,26 +766,25 @@ class SlowTorchAoTests(unittest.TestCase):
     def test_quantization(self):
         # fmt: off
         QUANTIZATION_TYPES_TO_TEST = [
-            ("int8wo", np.array([0.0505, 0.0742, 0.1367, 0.0429, 0.0585, 0.1386, 0.0585, 0.0703, 0.1367, 0.0566, 0.0703, 0.1464, 0.0546, 0.0703, 0.1425, 0.0546, 0.3535, 0.7578, 0.5000, 0.4062, 0.7656, 0.5117, 0.4121, 0.7656, 0.5117, 0.3984, 0.7578, 0.5234, 0.4023, 0.7382, 0.5390, 0.4570])),
-            ("int8dq", np.array([0.0546, 0.0761, 0.1386, 0.0488, 0.0644, 0.1425, 0.0605, 0.0742, 0.1406, 0.0625, 0.0722, 0.1523, 0.0625, 0.0742, 0.1503, 0.0605, 0.3886, 0.7968, 0.5507, 0.4492, 0.7890, 0.5351, 0.4316, 0.8007, 0.5390, 0.4179, 0.8281, 0.5820, 0.4531, 0.7812, 0.5703, 0.4921])),
+            (Int8WeightOnlyConfig(), np.array([0.0505, 0.0742, 0.1367, 0.0429, 0.0585, 0.1386, 0.0585, 0.0703, 0.1367, 0.0566, 0.0703, 0.1464, 0.0546, 0.0703, 0.1425, 0.0546, 0.3535, 0.7578, 0.5000, 0.4062, 0.7656, 0.5117, 0.4121, 0.7656, 0.5117, 0.3984, 0.7578, 0.5234, 0.4023, 0.7382, 0.5390, 0.4570])),
+            (Int8DynamicActivationInt8WeightConfig(), np.array([0.0546, 0.0761, 0.1386, 0.0488, 0.0644, 0.1425, 0.0605, 0.0742, 0.1406, 0.0625, 0.0722, 0.1523, 0.0625, 0.0742, 0.1503, 0.0605, 0.3886, 0.7968, 0.5507, 0.4492, 0.7890, 0.5351, 0.4316, 0.8007, 0.5390, 0.4179, 0.8281, 0.5820, 0.4531, 0.7812, 0.5703, 0.4921])),
         ]
 
-        if TorchAoConfig._is_cuda_capability_atleast_8_9():
+        if _is_xpu_or_cuda_capability_atleast_8_9():
             QUANTIZATION_TYPES_TO_TEST.extend([
-                ("float8wo_e4m3", np.array([0.0546, 0.0722, 0.1328, 0.0468, 0.0585, 0.1367, 0.0605, 0.0703, 0.1328, 0.0625, 0.0703, 0.1445, 0.0585, 0.0703, 0.1406, 0.0605, 0.3496, 0.7109, 0.4843, 0.4042, 0.7226, 0.5000, 0.4160, 0.7031, 0.4824, 0.3886, 0.6757, 0.4667, 0.3710, 0.6679, 0.4902, 0.4238])),
-                ("fp5_e3m1", np.array([0.0527, 0.0762, 0.1309, 0.0449, 0.0645, 0.1328, 0.0566, 0.0723, 0.125, 0.0566, 0.0703, 0.1328, 0.0566, 0.0742, 0.1348, 0.0566, 0.3633, 0.7617, 0.5273, 0.4277, 0.7891, 0.5469, 0.4375, 0.8008, 0.5586, 0.4336, 0.7383, 0.5156, 0.3906, 0.6992, 0.5156, 0.4375])),
+                (Float8WeightOnlyConfig(weight_dtype=torch.float8_e4m3fn), np.array([0.0546, 0.0722, 0.1328, 0.0468, 0.0585, 0.1367, 0.0605, 0.0703, 0.1328, 0.0625, 0.0703, 0.1445, 0.0585, 0.0703, 0.1406, 0.0605, 0.3496, 0.7109, 0.4843, 0.4042, 0.7226, 0.5000, 0.4160, 0.7031, 0.4824, 0.3886, 0.6757, 0.4667, 0.3710, 0.6679, 0.4902, 0.4238])),
             ])
         # fmt: on
 
-        for quantization_name, expected_slice in QUANTIZATION_TYPES_TO_TEST:
-            quantization_config = TorchAoConfig(quant_type=quantization_name, modules_to_not_convert=["x_embedder"])
+        for quant_config, expected_slice in QUANTIZATION_TYPES_TO_TEST:
+            quantization_config = TorchAoConfig(quant_type=quant_config, modules_to_not_convert=["x_embedder"])
             self._test_quant_type(quantization_config, expected_slice)
             gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            backend_empty_cache(torch_device)
+            backend_synchronize(torch_device)
 
     def test_serialization_int8wo(self):
-        quantization_config = TorchAoConfig("int8wo")
+        quantization_config = TorchAoConfig(Int8WeightOnlyConfig())
         components = self.get_dummy_components(quantization_config)
         pipe = FluxPipeline(**components)
         pipe.enable_model_cpu_offload()
@@ -706,8 +800,8 @@ class SlowTorchAoTests(unittest.TestCase):
             pipe.remove_all_hooks()
             del pipe.transformer
             gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            backend_empty_cache(torch_device)
+            backend_synchronize(torch_device)
             transformer = FluxTransformer2DModel.from_pretrained(
                 tmp_dir, torch_dtype=torch.bfloat16, use_safetensors=False
             )
@@ -727,7 +821,7 @@ class SlowTorchAoTests(unittest.TestCase):
     def test_memory_footprint_int4wo(self):
         # The original checkpoints are in bf16 and about 24 GB
         expected_memory_in_gb = 6.0
-        quantization_config = TorchAoConfig("int4wo")
+        quantization_config = TorchAoConfig(Int4WeightOnlyConfig())
         cache_dir = None
         transformer = FluxTransformer2DModel.from_pretrained(
             "black-forest-labs/FLUX.1-dev",
@@ -742,7 +836,7 @@ class SlowTorchAoTests(unittest.TestCase):
     def test_memory_footprint_int8wo(self):
         # The original checkpoints are in bf16 and about 24 GB
         expected_memory_in_gb = 12.0
-        quantization_config = TorchAoConfig("int8wo")
+        quantization_config = TorchAoConfig(Int8WeightOnlyConfig())
         cache_dir = None
         transformer = FluxTransformer2DModel.from_pretrained(
             "black-forest-labs/FLUX.1-dev",
@@ -756,14 +850,14 @@ class SlowTorchAoTests(unittest.TestCase):
 
 
 @require_torch
-@require_torch_gpu
-@require_torchao_version_greater_or_equal("0.7.0")
+@require_torch_accelerator
+@require_torchao_version_greater_or_equal("0.15.0")
 @slow
 @nightly
 class SlowTorchAoPreserializedModelTests(unittest.TestCase):
     def tearDown(self):
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def get_dummy_inputs(self, device: torch.device, seed: int = 0):
         if str(device).startswith("mps"):

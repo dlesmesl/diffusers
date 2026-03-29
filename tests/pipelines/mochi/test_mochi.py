@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team.
+# Copyright 2025 The HuggingFace Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,28 +17,30 @@ import inspect
 import unittest
 
 import numpy as np
-import pytest
 import torch
-from transformers import AutoTokenizer, T5EncoderModel
+from transformers import AutoConfig, AutoTokenizer, T5EncoderModel
 
 from diffusers import AutoencoderKLMochi, FlowMatchEulerDiscreteScheduler, MochiPipeline, MochiTransformer3DModel
-from diffusers.utils.testing_utils import (
+
+from ...testing_utils import (
+    backend_empty_cache,
     enable_full_determinism,
     nightly,
     numpy_cosine_similarity_distance,
-    require_big_gpu_with_torch_cuda,
-    require_torch_gpu,
+    require_big_accelerator,
+    require_torch_accelerator,
     torch_device,
 )
-
 from ..pipeline_params import TEXT_TO_IMAGE_BATCH_PARAMS, TEXT_TO_IMAGE_IMAGE_PARAMS, TEXT_TO_IMAGE_PARAMS
-from ..test_pipelines_common import PipelineTesterMixin, to_np
+from ..test_pipelines_common import FasterCacheTesterMixin, FirstBlockCacheTesterMixin, PipelineTesterMixin, to_np
 
 
 enable_full_determinism()
 
 
-class MochiPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
+class MochiPipelineFastTests(
+    PipelineTesterMixin, FasterCacheTesterMixin, FirstBlockCacheTesterMixin, unittest.TestCase
+):
     pipeline_class = MochiPipeline
     params = TEXT_TO_IMAGE_PARAMS - {"cross_attention_kwargs"}
     batch_params = TEXT_TO_IMAGE_BATCH_PARAMS
@@ -58,13 +60,13 @@ class MochiPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
     test_layerwise_casting = True
     test_group_offloading = True
 
-    def get_dummy_components(self):
+    def get_dummy_components(self, num_layers: int = 2):
         torch.manual_seed(0)
         transformer = MochiTransformer3DModel(
             patch_size=2,
             num_attention_heads=2,
             attention_head_dim=8,
-            num_layers=2,
+            num_layers=num_layers,
             pooled_projection_dim=16,
             in_channels=12,
             out_channels=None,
@@ -87,7 +89,8 @@ class MochiPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
         torch.manual_seed(0)
         scheduler = FlowMatchEulerDiscreteScheduler()
-        text_encoder = T5EncoderModel.from_pretrained("hf-internal-testing/tiny-random-t5")
+        config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-t5")
+        text_encoder = T5EncoderModel(config)
         tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/tiny-random-t5")
 
         components = {
@@ -205,6 +208,9 @@ class MochiPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
             return
 
         components = self.get_dummy_components()
+        for key in components:
+            if "text_encoder" in key and hasattr(components[key], "eval"):
+                components[key].eval()
         pipe = self.pipeline_class(**components)
         for component in pipe.components.values():
             if hasattr(component, "set_default_attn_processor"):
@@ -265,27 +271,26 @@ class MochiPipelineFastTests(PipelineTesterMixin, unittest.TestCase):
 
 
 @nightly
-@require_torch_gpu
-@require_big_gpu_with_torch_cuda
-@pytest.mark.big_gpu_with_torch_cuda
+@require_torch_accelerator
+@require_big_accelerator
 class MochiPipelineIntegrationTests(unittest.TestCase):
     prompt = "A painting of a squirrel eating a burger."
 
     def setUp(self):
         super().setUp()
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def tearDown(self):
         super().tearDown()
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def test_mochi(self):
         generator = torch.Generator("cpu").manual_seed(0)
 
         pipe = MochiPipeline.from_pretrained("genmo/mochi-1-preview", torch_dtype=torch.float16)
-        pipe.enable_model_cpu_offload()
+        pipe.enable_model_cpu_offload(device=torch_device)
         prompt = self.prompt
 
         videos = pipe(
@@ -301,5 +306,5 @@ class MochiPipelineIntegrationTests(unittest.TestCase):
         video = videos[0]
         expected_video = torch.randn(1, 19, 480, 848, 3).numpy()
 
-        max_diff = numpy_cosine_similarity_distance(video, expected_video)
+        max_diff = numpy_cosine_similarity_distance(video.cpu(), expected_video)
         assert max_diff < 1e-3, f"Max diff is too high. got {video}"

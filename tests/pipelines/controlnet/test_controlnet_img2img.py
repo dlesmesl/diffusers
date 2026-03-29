@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 HuggingFace Inc.
+# Copyright 2025 HuggingFace Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,7 +35,10 @@ from diffusers import (
 from diffusers.pipelines.controlnet.pipeline_controlnet import MultiControlNetModel
 from diffusers.utils import load_image
 from diffusers.utils.import_utils import is_xformers_available
-from diffusers.utils.testing_utils import (
+from diffusers.utils.torch_utils import randn_tensor
+
+from ...testing_utils import (
+    backend_empty_cache,
     enable_full_determinism,
     floats_tensor,
     load_numpy,
@@ -43,8 +46,6 @@ from diffusers.utils.testing_utils import (
     slow,
     torch_device,
 )
-from diffusers.utils.torch_utils import randn_tensor
-
 from ..pipeline_params import (
     IMAGE_TO_IMAGE_IMAGE_PARAMS,
     TEXT_GUIDED_IMAGE_VARIATION_BATCH_PARAMS,
@@ -188,6 +189,13 @@ class ControlNetImg2ImgPipelineFastTests(
 
     def test_inference_batch_single_identical(self):
         self._test_inference_batch_single_identical(expected_max_diff=2e-3)
+
+    def test_encode_prompt_works_in_isolation(self):
+        extra_required_param_value_dict = {
+            "device": torch.device(torch_device).type,
+            "do_classifier_free_guidance": self.get_dummy_inputs(device=torch_device).get("guidance_scale", 1.0) > 1.0,
+        }
+        return super().test_encode_prompt_works_in_isolation(extra_required_param_value_dict)
 
 
 class StableDiffusionMultiControlNetPipelineFastTests(
@@ -391,6 +399,13 @@ class StableDiffusionMultiControlNetPipelineFastTests(
             except NotImplementedError:
                 pass
 
+    def test_encode_prompt_works_in_isolation(self):
+        extra_required_param_value_dict = {
+            "device": torch.device(torch_device).type,
+            "do_classifier_free_guidance": self.get_dummy_inputs(device=torch_device).get("guidance_scale", 1.0) > 1.0,
+        }
+        return super().test_encode_prompt_works_in_isolation(extra_required_param_value_dict)
+
 
 @slow
 @require_torch_accelerator
@@ -398,12 +413,12 @@ class ControlNetImg2ImgPipelineSlowTests(unittest.TestCase):
     def setUp(self):
         super().setUp()
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def tearDown(self):
         super().tearDown()
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def test_canny(self):
         controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-canny")

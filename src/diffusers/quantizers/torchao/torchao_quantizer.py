@@ -18,13 +18,24 @@ https://github.com/huggingface/transformers/blob/3a8eb74668e9c2cc563b2f5c62fac17
 """
 
 import importlib
+import re
 import types
-from typing import TYPE_CHECKING, Any, Dict, List, Union
+from typing import TYPE_CHECKING, Any
 
 from packaging import version
 
-from ...utils import get_module_from_name, is_torch_available, is_torch_version, is_torchao_available, logging
+from ...utils import (
+    get_module_from_name,
+    is_torch_available,
+    is_torch_version,
+    is_torchao_available,
+    is_torchao_version,
+    logging,
+)
 from ..base import DiffusersQuantizer
+
+
+logger = logging.get_logger(__name__)
 
 
 if TYPE_CHECKING:
@@ -62,7 +73,64 @@ if is_torchao_available():
     from torchao.quantization import quantize_
 
 
-logger = logging.get_logger(__name__)
+def _update_torch_safe_globals():
+    safe_globals = [
+        (torch.uint1, "torch.uint1"),
+        (torch.uint2, "torch.uint2"),
+        (torch.uint3, "torch.uint3"),
+        (torch.uint4, "torch.uint4"),
+        (torch.uint5, "torch.uint5"),
+        (torch.uint6, "torch.uint6"),
+        (torch.uint7, "torch.uint7"),
+    ]
+    try:
+        from torchao.dtypes import NF4Tensor
+        from torchao.dtypes.uintx.uintx_layout import UintxAQTTensorImpl, UintxTensor
+
+        safe_globals.extend([UintxTensor, UintxAQTTensorImpl, NF4Tensor])
+
+        # note: is_torchao_version(">=", "0.16.0") does not work correctly
+        # with torchao nightly, so using a ">" check which does work correctly
+        if is_torchao_version(">", "0.15.0"):
+            pass
+        else:
+            from torchao.dtypes.floatx.float8_layout import Float8AQTTensorImpl
+            from torchao.dtypes.uintx.uint4_layout import UInt4Tensor
+
+            safe_globals.extend([UInt4Tensor, Float8AQTTensorImpl])
+
+    except (ImportError, ModuleNotFoundError) as e:
+        logger.warning(
+            "Unable to import `torchao` Tensor objects. This may affect loading checkpoints serialized with `torchao`"
+        )
+        logger.debug(e)
+
+    finally:
+        torch.serialization.add_safe_globals(safe_globals=safe_globals)
+
+
+if (
+    is_torch_available()
+    and is_torch_version(">=", "2.6.0")
+    and is_torchao_available()
+    and is_torchao_version(">=", "0.15.0")
+):
+    _update_torch_safe_globals()
+
+
+def fuzzy_match_size(config_name: str) -> str | None:
+    """
+    Extract the size digit from strings like "4weight", "8weight". Returns the digit as an integer if found, otherwise
+    None.
+    """
+    config_name = config_name.lower()
+
+    str_match = re.search(r"(\d)weight", config_name)
+
+    if str_match:
+        return str_match.group(1)
+
+    return None
 
 
 def _quantization_type(weight):
@@ -100,10 +168,10 @@ class TorchAoHfQuantizer(DiffusersQuantizer):
             raise ImportError(
                 "Loading a TorchAO quantized model requires the torchao library. Please install with `pip install torchao`"
             )
-        torchao_version = version.parse(importlib.metadata.version("torch"))
-        if torchao_version < version.parse("0.7.0"):
+        torchao_version = version.parse(importlib.metadata.version("torchao"))
+        if torchao_version < version.parse("0.15.0"):
             raise RuntimeError(
-                f"The minimum required version of `torchao` is 0.7.0, but the current version is {torchao_version}. Please upgrade with `pip install -U torchao`."
+                f"The minimum required version of `torchao` is 0.15.0, but the current version is {torchao_version}. Please upgrade with `pip install -U torchao`."
             )
 
         self.offload = False
@@ -130,14 +198,13 @@ class TorchAoHfQuantizer(DiffusersQuantizer):
                     )
 
     def update_torch_dtype(self, torch_dtype):
-        quant_type = self.quantization_config.quant_type
-
-        if quant_type.startswith("int") or quant_type.startswith("uint"):
-            if torch_dtype is not None and torch_dtype != torch.bfloat16:
-                logger.warning(
-                    f"You are trying to set torch_dtype to {torch_dtype} for int4/int8/uintx quantization, but "
-                    f"only bfloat16 is supported right now. Please set `torch_dtype=torch.bfloat16`."
-                )
+        config_name = self.quantization_config.quant_type.__class__.__name__
+        is_int_quant = config_name.startswith("Int") or config_name.startswith("Uint")
+        if is_int_quant and torch_dtype is not None and torch_dtype != torch.bfloat16:
+            logger.warning(
+                f"You are trying to set torch_dtype to {torch_dtype} for integer quantization, but "
+                f"only bfloat16 is supported right now. Please set `torch_dtype=torch.bfloat16`."
+            )
 
         if torch_dtype is None:
             # We need to set the torch_dtype, otherwise we have dtype mismatch when performing the quantized linear op
@@ -151,25 +218,16 @@ class TorchAoHfQuantizer(DiffusersQuantizer):
         return torch_dtype
 
     def adjust_target_dtype(self, target_dtype: "torch.dtype") -> "torch.dtype":
-        quant_type = self.quantization_config.quant_type
+        from accelerate.utils import CustomDtype
 
-        if quant_type.startswith("int8") or quant_type.startswith("int4"):
-            # Note that int4 weights are created by packing into torch.int8, but since there is no torch.int4, we use torch.int8
+        quant_type = self.quantization_config.quant_type
+        config_name = quant_type.__class__.__name__
+        size_digit = fuzzy_match_size(config_name)
+
+        if size_digit == "4":
+            return CustomDtype.INT4
+        else:
             return torch.int8
-        elif quant_type == "uintx_weight_only":
-            return self.quantization_config.quant_type_kwargs.get("dtype", torch.uint8)
-        elif quant_type.startswith("uint"):
-            return {
-                1: torch.uint1,
-                2: torch.uint2,
-                3: torch.uint3,
-                4: torch.uint4,
-                5: torch.uint5,
-                6: torch.uint6,
-                7: torch.uint7,
-            }[int(quant_type[4])]
-        elif quant_type.startswith("float") or quant_type.startswith("fp"):
-            return torch.bfloat16
 
         if isinstance(target_dtype, SUPPORTED_TORCH_DTYPES_FOR_QUANTIZATION):
             return target_dtype
@@ -183,7 +241,7 @@ class TorchAoHfQuantizer(DiffusersQuantizer):
             f"dtype you are using should be supported, please open an issue at https://github.com/huggingface/diffusers/issues."
         )
 
-    def adjust_max_memory(self, max_memory: Dict[str, Union[int, str]]) -> Dict[str, Union[int, str]]:
+    def adjust_max_memory(self, max_memory: dict[str, int | str]) -> dict[str, int | str]:
         max_memory = {key: val * 0.9 for key, val in max_memory.items()}
         return max_memory
 
@@ -192,7 +250,7 @@ class TorchAoHfQuantizer(DiffusersQuantizer):
         model: "ModelMixin",
         param_value: "torch.Tensor",
         param_name: str,
-        state_dict: Dict[str, Any],
+        state_dict: dict[str, Any],
         **kwargs,
     ) -> bool:
         param_device = kwargs.pop("param_device", None)
@@ -213,11 +271,12 @@ class TorchAoHfQuantizer(DiffusersQuantizer):
         param_value: "torch.Tensor",
         param_name: str,
         target_device: "torch.device",
-        state_dict: Dict[str, Any],
-        unexpected_keys: List[str],
+        state_dict: dict[str, Any],
+        unexpected_keys: list[str],
+        **kwargs,
     ):
         r"""
-        Each nn.Linear layer that needs to be quantized is processsed here. First, we set the value the weight tensor,
+        Each nn.Linear layer that needs to be quantized is processed here. First, we set the value the weight tensor,
         then we move it to the target device. Finally, we quantize the module.
         """
         module, tensor_name = get_module_from_name(model, param_name)
@@ -233,11 +292,35 @@ class TorchAoHfQuantizer(DiffusersQuantizer):
             module._parameters[tensor_name] = torch.nn.Parameter(param_value).to(device=target_device)
             quantize_(module, self.quantization_config.get_apply_tensor_subclass())
 
+    def get_cuda_warm_up_factor(self):
+        """
+        This factor is used in caching_allocator_warmup to determine how many bytes to pre-allocate for CUDA warmup.
+        - A factor of 2 means we pre-allocate the full memory footprint of the model.
+        - A factor of 4 means we pre-allocate half of that, and so on
+
+        However, when using TorchAO, calculating memory usage with param.numel() * param.element_size() doesn't give
+        the correct size for quantized weights (like int4 or int8) That's because TorchAO internally represents
+        quantized tensors using subtensors and metadata, and the reported element_size() still corresponds to the
+        torch_dtype not the actual bit-width of the quantized data.
+
+        To correct for this:
+        - Use a division factor of 8 for int4 weights
+        - Use a division factor of 4 for int8 weights
+        """
+        quant_type = self.quantization_config.quant_type
+        config_name = quant_type.__class__.__name__
+        size_digit = fuzzy_match_size(config_name)
+
+        if size_digit == "4":
+            return 8
+        else:
+            return 4
+
     def _process_model_before_weight_loading(
         self,
         model: "ModelMixin",
         device_map,
-        keep_in_fp32_modules: List[str] = [],
+        keep_in_fp32_modules: list[str] = [],
         **kwargs,
     ):
         self.modules_to_not_convert = self.quantization_config.modules_to_not_convert
@@ -287,6 +370,18 @@ class TorchAoHfQuantizer(DiffusersQuantizer):
 
         return _is_torchao_serializable
 
+    _TRAINABLE_QUANTIZATION_CONFIGS = (
+        "Int8WeightOnlyConfig",
+        "Int8DynamicActivationInt8WeightConfig",
+        "Int8StaticActivationInt8WeightConfig",
+        "Float8WeightOnlyConfig",
+        "Float8DynamicActivationFloat8WeightConfig",
+    )
+
     @property
     def is_trainable(self):
-        return self.quantization_config.quant_type.startswith("int8")
+        return self.quantization_config.quant_type.__class__.__name__ in self._TRAINABLE_QUANTIZATION_CONFIGS
+
+    @property
+    def is_compileable(self) -> bool:
+        return True

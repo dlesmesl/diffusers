@@ -37,11 +37,11 @@ from diffusers import (
 )
 
 # from diffusers.image_processor import VaeImageProcessor
-from diffusers.utils.testing_utils import (
+from ...testing_utils import (
     enable_full_determinism,
     floats_tensor,
     load_image,
-    require_torch_gpu,
+    require_torch_accelerator,
     skip_mps,
     slow,
     torch_device,
@@ -253,7 +253,7 @@ class LEditsPPPipelineStableDiffusionXLFastTests(unittest.TestCase):
 
 
 @slow
-@require_torch_gpu
+@require_torch_accelerator
 class LEditsPPPipelineStableDiffusionXLSlowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

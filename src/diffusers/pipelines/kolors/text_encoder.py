@@ -1,4 +1,4 @@
-# Copyright 2024 ChatGLM3-6B Model Team, Kwai-Kolors Team and The HuggingFace Team. All rights reserved.
+# Copyright 2025 ChatGLM3-6B Model Team, Kwai-Kolors Team and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import math
-from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -102,13 +101,6 @@ class RMSNorm(torch.nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
 
         return (self.weight * hidden_states).to(input_dtype)
-
-
-def _config_to_kwargs(args):
-    common_kwargs = {
-        "dtype": args.torch_dtype,
-    }
-    return common_kwargs
 
 
 class CoreAttention(torch.nn.Module):
@@ -241,7 +233,7 @@ def split_tensor_along_last_dim(
     tensor: torch.Tensor,
     num_partitions: int,
     contiguous_split_chunks: bool = False,
-) -> List[torch.Tensor]:
+) -> list[torch.Tensor]:
     """Split a tensor along its last dimension.
 
     Arguments:
@@ -314,7 +306,6 @@ class SelfAttention(torch.nn.Module):
             self.qkv_hidden_size,
             bias=config.add_bias_linear or config.add_qkv_bias,
             device=device,
-            **_config_to_kwargs(config),
         )
 
         self.core_attention = CoreAttention(config, self.layer_number)
@@ -325,7 +316,6 @@ class SelfAttention(torch.nn.Module):
             config.hidden_size,
             bias=config.add_bias_linear,
             device=device,
-            **_config_to_kwargs(config),
         )
 
     def _allocate_memory(self, inference_max_sequence_len, batch_size, device=None, dtype=None):
@@ -443,13 +433,12 @@ class MLP(torch.nn.Module):
 
         self.add_bias = config.add_bias_linear
 
-        # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
+        # Project to 4h. If using swiglu double the output width, see https://huggingface.co/papers/2002.05202
         self.dense_h_to_4h = nn.Linear(
             config.hidden_size,
             config.ffn_hidden_size * 2,
             bias=self.add_bias,
             device=device,
-            **_config_to_kwargs(config),
         )
 
         def swiglu(x):
@@ -459,9 +448,7 @@ class MLP(torch.nn.Module):
         self.activation_func = swiglu
 
         # Project back to h.
-        self.dense_4h_to_h = nn.Linear(
-            config.ffn_hidden_size, config.hidden_size, bias=self.add_bias, device=device, **_config_to_kwargs(config)
-        )
+        self.dense_4h_to_h = nn.Linear(config.ffn_hidden_size, config.hidden_size, bias=self.add_bias, device=device)
 
     def forward(self, hidden_states):
         # [s, b, 4hp]
@@ -488,18 +475,14 @@ class GLMBlock(torch.nn.Module):
 
         LayerNormFunc = RMSNorm if config.rmsnorm else LayerNorm
         # Layernorm on the input data.
-        self.input_layernorm = LayerNormFunc(
-            config.hidden_size, eps=config.layernorm_epsilon, device=device, dtype=config.torch_dtype
-        )
+        self.input_layernorm = LayerNormFunc(config.hidden_size, eps=config.layernorm_epsilon, device=device)
 
         # Self attention.
         self.self_attention = SelfAttention(config, layer_number, device=device)
         self.hidden_dropout = config.hidden_dropout
 
         # Layernorm on the attention output
-        self.post_attention_layernorm = LayerNormFunc(
-            config.hidden_size, eps=config.layernorm_epsilon, device=device, dtype=config.torch_dtype
-        )
+        self.post_attention_layernorm = LayerNormFunc(config.hidden_size, eps=config.layernorm_epsilon, device=device)
 
         # MLP
         self.mlp = MLP(config, device=device)
@@ -569,9 +552,7 @@ class GLMTransformer(torch.nn.Module):
         if self.post_layer_norm:
             LayerNormFunc = RMSNorm if config.rmsnorm else LayerNorm
             # Final layer norm before output.
-            self.final_layernorm = LayerNormFunc(
-                config.hidden_size, eps=config.layernorm_epsilon, device=device, dtype=config.torch_dtype
-            )
+            self.final_layernorm = LayerNormFunc(config.hidden_size, eps=config.layernorm_epsilon, device=device)
 
         self.gradient_checkpointing = False
 
@@ -584,8 +565,8 @@ class GLMTransformer(torch.nn.Module):
         attention_mask,
         rotary_pos_emb,
         kv_caches=None,
-        use_cache: Optional[bool] = True,
-        output_hidden_states: Optional[bool] = False,
+        use_cache: bool | None = True,
+        output_hidden_states: bool | None = False,
     ):
         if not kv_caches:
             kv_caches = [None for _ in range(self.num_layers)]
@@ -679,16 +660,14 @@ class Embedding(torch.nn.Module):
 
         self.hidden_size = config.hidden_size
         # Word embeddings (parallel).
-        self.word_embeddings = nn.Embedding(
-            config.padded_vocab_size, self.hidden_size, dtype=config.torch_dtype, device=device
-        )
+        self.word_embeddings = nn.Embedding(config.padded_vocab_size, self.hidden_size, device=device)
         self.fp32_residual_connection = config.fp32_residual_connection
 
     def forward(self, input_ids):
         # Embeddings.
         words_embeddings = self.word_embeddings(input_ids)
         embeddings = words_embeddings
-        # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
+        # Data format change to avoid explicit transposes : [b s h] --> [s b h].
         embeddings = embeddings.transpose(0, 1).contiguous()
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.fp32_residual_connection:
@@ -784,16 +763,13 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             config.hidden_size // config.num_attention_heads if config.kv_channels is None else config.kv_channels
         )
 
-        self.rotary_pos_emb = RotaryEmbedding(
-            rotary_dim // 2, original_impl=config.original_rope, device=device, dtype=config.torch_dtype
-        )
+        self.rotary_pos_emb = RotaryEmbedding(rotary_dim // 2, original_impl=config.original_rope, device=device)
         self.encoder = init_method(GLMTransformer, config, **init_kwargs)
         self.output_layer = init_method(
             nn.Linear,
             config.hidden_size,
             config.padded_vocab_size,
             bias=False,
-            dtype=config.torch_dtype,
             **init_kwargs,
         )
         self.pre_seq_len = config.pre_seq_len
@@ -804,6 +780,9 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             self.prefix_tokens = torch.arange(self.pre_seq_len).long()
             self.prefix_encoder = PrefixEncoder(config)
             self.dropout = torch.nn.Dropout(0.1)
+
+        if hasattr(self, "post_init"):
+            self.post_init()
 
     def get_input_embeddings(self):
         return self.embedding.word_embeddings
@@ -822,19 +801,19 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
     def forward(
         self,
         input_ids,
-        position_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.BoolTensor] = None,
-        full_attention_mask: Optional[torch.BoolTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        position_ids: torch.Tensor | None = None,
+        attention_mask: torch.BoolTensor | None = None,
+        full_attention_mask: torch.BoolTensor | None = None,
+        past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
     ):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        use_cache = use_cache if use_cache is not None else getattr(self.config, "use_cache", None)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         batch_size, seq_length = input_ids.shape

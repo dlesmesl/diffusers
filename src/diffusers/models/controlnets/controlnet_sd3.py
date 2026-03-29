@@ -1,4 +1,4 @@
-# Copyright 2024 Stability AI, The HuggingFace Team and The InstantX Team. All rights reserved.
+# Copyright 2025 Stability AI, The HuggingFace Team and The InstantX Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,16 +14,16 @@
 
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 import torch
 import torch.nn as nn
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
-from ...utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers
-from ..attention import JointTransformerBlock
-from ..attention_processor import Attention, AttentionProcessor, FusedJointAttnProcessor2_0
+from ...utils import apply_lora_scale, logging
+from ..attention import AttentionMixin, JointTransformerBlock
+from ..attention_processor import Attention, FusedJointAttnProcessor2_0
 from ..embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
@@ -36,10 +36,52 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 @dataclass
 class SD3ControlNetOutput(BaseOutput):
-    controlnet_block_samples: Tuple[torch.Tensor]
+    controlnet_block_samples: tuple[torch.Tensor]
 
 
-class SD3ControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
+class SD3ControlNetModel(ModelMixin, AttentionMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
+    r"""
+    ControlNet model for [Stable Diffusion 3](https://huggingface.co/papers/2403.03206).
+
+    Parameters:
+        sample_size (`int`, defaults to `128`):
+            The width/height of the latents. This is fixed during training since it is used to learn a number of
+            position embeddings.
+        patch_size (`int`, defaults to `2`):
+            Patch size to turn the input data into small patches.
+        in_channels (`int`, defaults to `16`):
+            The number of latent channels in the input.
+        num_layers (`int`, defaults to `18`):
+            The number of layers of transformer blocks to use.
+        attention_head_dim (`int`, defaults to `64`):
+            The number of channels in each head.
+        num_attention_heads (`int`, defaults to `18`):
+            The number of heads to use for multi-head attention.
+        joint_attention_dim (`int`, defaults to `4096`):
+            The embedding dimension to use for joint text-image attention.
+        caption_projection_dim (`int`, defaults to `1152`):
+            The embedding dimension of caption embeddings.
+        pooled_projection_dim (`int`, defaults to `2048`):
+            The embedding dimension of pooled text projections.
+        out_channels (`int`, defaults to `16`):
+            The number of latent channels in the output.
+        pos_embed_max_size (`int`, defaults to `96`):
+            The maximum latent height/width of positional embeddings.
+        extra_conditioning_channels (`int`, defaults to `0`):
+            The number of extra channels to use for conditioning for patch embedding.
+        dual_attention_layers (`tuple[int, ...]`, defaults to `()`):
+            The number of dual-stream transformer blocks to use.
+        qk_norm (`str`, *optional*, defaults to `None`):
+            The normalization to use for query and key in the attention layer. If `None`, no normalization is used.
+        pos_embed_type (`str`, defaults to `"sincos"`):
+            The type of positional embedding to use. Choose between `"sincos"` and `None`.
+        use_pos_embed (`bool`, defaults to `True`):
+            Whether to use positional embeddings.
+        force_zeros_for_pooled_projection (`bool`, defaults to `True`):
+            Whether to force zeros for pooled projection embeddings. This is handled in the pipelines by reading the
+            config value of the ControlNet model.
+    """
+
     _supports_gradient_checkpointing = True
 
     @register_to_config
@@ -57,9 +99,9 @@ class SD3ControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
         out_channels: int = 16,
         pos_embed_max_size: int = 96,
         extra_conditioning_channels: int = 0,
-        dual_attention_layers: Tuple[int, ...] = (),
-        qk_norm: Optional[str] = None,
-        pos_embed_type: Optional[str] = "sincos",
+        dual_attention_layers: tuple[int, ...] = (),
+        qk_norm: str | None = None,
+        pos_embed_type: str | None = "sincos",
         use_pos_embed: bool = True,
         force_zeros_for_pooled_projection: bool = True,
     ):
@@ -93,7 +135,7 @@ class SD3ControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
                     JointTransformerBlock(
                         dim=self.inner_dim,
                         num_attention_heads=num_attention_heads,
-                        attention_head_dim=self.config.attention_head_dim,
+                        attention_head_dim=attention_head_dim,
                         context_pre_only=False,
                         qk_norm=qk_norm,
                         use_dual_attention=True if i in dual_attention_layers else False,
@@ -108,7 +150,7 @@ class SD3ControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
                     SD3SingleTransformerBlock(
                         dim=self.inner_dim,
                         num_attention_heads=num_attention_heads,
-                        attention_head_dim=self.config.attention_head_dim,
+                        attention_head_dim=attention_head_dim,
                     )
                     for _ in range(num_layers)
                 ]
@@ -133,7 +175,7 @@ class SD3ControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
         self.gradient_checkpointing = False
 
     # Copied from diffusers.models.unets.unet_3d_condition.UNet3DConditionModel.enable_forward_chunking
-    def enable_forward_chunking(self, chunk_size: Optional[int] = None, dim: int = 0) -> None:
+    def enable_forward_chunking(self, chunk_size: int | None = None, dim: int = 0) -> None:
         """
         Sets the attention processor to use [feed forward
         chunking](https://huggingface.co/blog/reformer#2-chunked-feed-forward-layers).
@@ -162,77 +204,13 @@ class SD3ControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
         for module in self.children():
             fn_recursive_feed_forward(module, chunk_size, dim)
 
-    @property
-    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.attn_processors
-    def attn_processors(self) -> Dict[str, AttentionProcessor]:
-        r"""
-        Returns:
-            `dict` of attention processors: A dictionary containing all attention processors used in the model with
-            indexed by its weight name.
-        """
-        # set recursively
-        processors = {}
-
-        def fn_recursive_add_processors(name: str, module: torch.nn.Module, processors: Dict[str, AttentionProcessor]):
-            if hasattr(module, "get_processor"):
-                processors[f"{name}.processor"] = module.get_processor()
-
-            for sub_name, child in module.named_children():
-                fn_recursive_add_processors(f"{name}.{sub_name}", child, processors)
-
-            return processors
-
-        for name, module in self.named_children():
-            fn_recursive_add_processors(name, module, processors)
-
-        return processors
-
-    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.set_attn_processor
-    def set_attn_processor(self, processor: Union[AttentionProcessor, Dict[str, AttentionProcessor]]):
-        r"""
-        Sets the attention processor to use to compute attention.
-
-        Parameters:
-            processor (`dict` of `AttentionProcessor` or only `AttentionProcessor`):
-                The instantiated processor class or a dictionary of processor classes that will be set as the processor
-                for **all** `Attention` layers.
-
-                If `processor` is a dict, the key needs to define the path to the corresponding cross attention
-                processor. This is strongly recommended when setting trainable attention processors.
-
-        """
-        count = len(self.attn_processors.keys())
-
-        if isinstance(processor, dict) and len(processor) != count:
-            raise ValueError(
-                f"A dict of processors was passed, but the number of processors {len(processor)} does not match the"
-                f" number of attention layers: {count}. Please make sure to pass {count} processor classes."
-            )
-
-        def fn_recursive_attn_processor(name: str, module: torch.nn.Module, processor):
-            if hasattr(module, "set_processor"):
-                if not isinstance(processor, dict):
-                    module.set_processor(processor)
-                else:
-                    module.set_processor(processor.pop(f"{name}.processor"))
-
-            for sub_name, child in module.named_children():
-                fn_recursive_attn_processor(f"{name}.{sub_name}", child, processor)
-
-        for name, module in self.named_children():
-            fn_recursive_attn_processor(name, module, processor)
-
     # Copied from diffusers.models.transformers.transformer_sd3.SD3Transformer2DModel.fuse_qkv_projections
     def fuse_qkv_projections(self):
         """
         Enables fused QKV projections. For self-attention modules, all projection matrices (i.e., query, key, value)
         are fused. For cross-attention modules, key and value projection matrices are fused.
 
-        <Tip warning={true}>
-
-        This API is 🧪 experimental.
-
-        </Tip>
+        > [!WARNING] > This API is 🧪 experimental.
         """
         self.original_attn_processors = None
 
@@ -252,11 +230,7 @@ class SD3ControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
     def unfuse_qkv_projections(self):
         """Disables the fused QKV projection if enabled.
 
-        <Tip warning={true}>
-
-        This API is 🧪 experimental.
-
-        </Tip>
+        > [!WARNING] > This API is 🧪 experimental.
 
         """
         if self.original_attn_processors is not None:
@@ -295,30 +269,31 @@ class SD3ControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
 
         return controlnet
 
+    @apply_lora_scale("joint_attention_kwargs")
     def forward(
         self,
-        hidden_states: torch.FloatTensor,
+        hidden_states: torch.Tensor,
         controlnet_cond: torch.Tensor,
         conditioning_scale: float = 1.0,
-        encoder_hidden_states: torch.FloatTensor = None,
-        pooled_projections: torch.FloatTensor = None,
+        encoder_hidden_states: torch.Tensor = None,
+        pooled_projections: torch.Tensor = None,
         timestep: torch.LongTensor = None,
-        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = True,
-    ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
+    ) -> torch.Tensor | Transformer2DModelOutput:
         """
         The [`SD3Transformer2DModel`] forward method.
 
         Args:
-            hidden_states (`torch.FloatTensor` of shape `(batch size, channel, height, width)`):
+            hidden_states (`torch.Tensor` of shape `(batch size, channel, height, width)`):
                 Input `hidden_states`.
             controlnet_cond (`torch.Tensor`):
                 The conditional input tensor of shape `(batch_size, sequence_length, hidden_size)`.
             conditioning_scale (`float`, defaults to `1.0`):
                 The scale factor for ControlNet outputs.
-            encoder_hidden_states (`torch.FloatTensor` of shape `(batch size, sequence_len, embed_dims)`):
+            encoder_hidden_states (`torch.Tensor` of shape `(batch size, sequence_len, embed_dims)`):
                 Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
-            pooled_projections (`torch.FloatTensor` of shape `(batch_size, projection_dim)`): Embeddings projected
+            pooled_projections (`torch.Tensor` of shape `(batch_size, projection_dim)`): Embeddings projected
                 from the embeddings of input conditions.
             timestep ( `torch.LongTensor`):
                 Used to indicate denoising step.
@@ -334,21 +309,6 @@ class SD3ControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
-        if joint_attention_kwargs is not None:
-            joint_attention_kwargs = joint_attention_kwargs.copy()
-            lora_scale = joint_attention_kwargs.pop("scale", 1.0)
-        else:
-            lora_scale = 1.0
-
-        if USE_PEFT_BACKEND:
-            # weight the lora layers by setting `lora_scale` for each PEFT layer
-            scale_lora_layers(self, lora_scale)
-        else:
-            if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
-                logger.warning(
-                    "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
-                )
-
         if self.pos_embed is not None and hidden_states.ndim != 4:
             raise ValueError("hidden_states must be 4D when pos_embed is used")
 
@@ -408,10 +368,6 @@ class SD3ControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginal
         # 6. scaling
         controlnet_block_res_samples = [sample * conditioning_scale for sample in controlnet_block_res_samples]
 
-        if USE_PEFT_BACKEND:
-            # remove `lora_scale` from each PEFT layer
-            unscale_lora_layers(self, lora_scale)
-
         if not return_dict:
             return (controlnet_block_res_samples,)
 
@@ -426,7 +382,7 @@ class SD3MultiControlNetModel(ModelMixin):
     compatible with `SD3ControlNetModel`.
 
     Args:
-        controlnets (`List[SD3ControlNetModel]`):
+        controlnets (`list[SD3ControlNetModel]`):
             Provides additional conditioning to the unet during the denoising process. You must set multiple
             `SD3ControlNetModel` as a list.
     """
@@ -437,15 +393,15 @@ class SD3MultiControlNetModel(ModelMixin):
 
     def forward(
         self,
-        hidden_states: torch.FloatTensor,
-        controlnet_cond: List[torch.tensor],
-        conditioning_scale: List[float],
-        pooled_projections: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
+        hidden_states: torch.Tensor,
+        controlnet_cond: list[torch.tensor],
+        conditioning_scale: list[float],
+        pooled_projections: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
         timestep: torch.LongTensor = None,
-        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = True,
-    ) -> Union[SD3ControlNetOutput, Tuple]:
+    ) -> SD3ControlNetOutput | tuple:
         for i, (image, scale, controlnet) in enumerate(zip(controlnet_cond, conditioning_scale, self.nets)):
             block_samples = controlnet(
                 hidden_states=hidden_states,

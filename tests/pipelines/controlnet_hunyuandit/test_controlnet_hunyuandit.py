@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 HuggingFace Inc and Tencent Hunyuan Team.
+# Copyright 2025 HuggingFace Inc and Tencent Hunyuan Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ import unittest
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, BertModel, T5EncoderModel
+from transformers import AutoConfig, AutoTokenizer, BertModel, T5EncoderModel
 
 from diffusers import (
     AutoencoderKL,
@@ -28,15 +28,15 @@ from diffusers import (
 )
 from diffusers.models import HunyuanDiT2DControlNetModel, HunyuanDiT2DMultiControlNetModel
 from diffusers.utils import load_image
-from diffusers.utils.testing_utils import (
+from diffusers.utils.torch_utils import randn_tensor
+
+from ...testing_utils import (
     backend_empty_cache,
     enable_full_determinism,
     require_torch_accelerator,
     slow,
     torch_device,
 )
-from diffusers.utils.torch_utils import randn_tensor
-
 from ..test_pipelines_common import PipelineTesterMixin
 
 
@@ -96,7 +96,10 @@ class HunyuanDiTControlNetPipelineFastTests(unittest.TestCase, PipelineTesterMix
         scheduler = DDPMScheduler()
         text_encoder = BertModel.from_pretrained("hf-internal-testing/tiny-random-BertModel")
         tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/tiny-random-BertModel")
-        text_encoder_2 = T5EncoderModel.from_pretrained("hf-internal-testing/tiny-random-t5")
+
+        torch.manual_seed(0)
+        config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-t5")
+        text_encoder_2 = T5EncoderModel(config)
         tokenizer_2 = AutoTokenizer.from_pretrained("hf-internal-testing/tiny-random-t5")
 
         components = {
@@ -153,13 +156,18 @@ class HunyuanDiTControlNetPipelineFastTests(unittest.TestCase, PipelineTesterMix
         image_slice = image[0, -3:, -3:, -1]
         assert image.shape == (1, 16, 16, 3)
 
-        expected_slice = np.array(
-            [0.6953125, 0.89208984, 0.59375, 0.5078125, 0.5786133, 0.6035156, 0.5839844, 0.53564453, 0.52246094]
-        )
+        if torch_device == "xpu":
+            expected_slice = np.array(
+                [0.6948242, 0.89160156, 0.59375, 0.5078125, 0.57910156, 0.6035156, 0.58447266, 0.53564453, 0.52246094]
+            )
+        else:
+            expected_slice = np.array(
+                [0.6953125, 0.89208984, 0.59375, 0.5078125, 0.5786133, 0.6035156, 0.5839844, 0.53564453, 0.52246094]
+            )
 
-        assert (
-            np.abs(image_slice.flatten() - expected_slice).max() < 1e-2
-        ), f"Expected: {expected_slice}, got: {image_slice.flatten()}"
+        assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-2, (
+            f"Expected: {expected_slice}, got: {image_slice.flatten()}"
+        )
 
     def test_inference_batch_single_identical(self):
         self._test_inference_batch_single_identical(
@@ -176,6 +184,12 @@ class HunyuanDiTControlNetPipelineFastTests(unittest.TestCase, PipelineTesterMix
 
     def test_save_load_optional_components(self):
         # TODO(YiYi) need to fix later
+        pass
+
+    @unittest.skip(
+        "Test not supported as `encode_prompt` is called two times separately which deivates from about 99% of the pipelines we have."
+    )
+    def test_encode_prompt_works_in_isolation(self):
         pass
 
 
@@ -345,6 +359,7 @@ class HunyuanDiTControlNetPipelineSlowTests(unittest.TestCase):
         assert image.shape == (1024, 1024, 3)
 
         original_image = image[-3:, -3:, -1].flatten()
+
         expected_image = np.array(
             [0.43652344, 0.44018555, 0.4494629, 0.44995117, 0.45654297, 0.44848633, 0.43603516, 0.4404297, 0.42626953]
         )

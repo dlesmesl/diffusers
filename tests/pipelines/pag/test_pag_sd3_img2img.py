@@ -5,7 +5,14 @@ import unittest
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, CLIPTextConfig, CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    CLIPTextConfig,
+    CLIPTextModelWithProjection,
+    CLIPTokenizer,
+    T5EncoderModel,
+)
 
 from diffusers import (
     AutoencoderKL,
@@ -15,15 +22,16 @@ from diffusers import (
     StableDiffusion3Img2ImgPipeline,
     StableDiffusion3PAGImg2ImgPipeline,
 )
-from diffusers.utils.testing_utils import (
+
+from ...testing_utils import (
+    backend_empty_cache,
     enable_full_determinism,
     floats_tensor,
     load_image,
-    require_torch_gpu,
+    require_torch_accelerator,
     slow,
     torch_device,
 )
-
 from ..pipeline_params import (
     IMAGE_TO_IMAGE_IMAGE_PARAMS,
     TEXT_GUIDED_IMAGE_VARIATION_BATCH_PARAMS,
@@ -83,7 +91,9 @@ class StableDiffusion3PAGImg2ImgPipelineFastTests(unittest.TestCase, PipelineTes
         torch.manual_seed(0)
         text_encoder_2 = CLIPTextModelWithProjection(clip_text_encoder_config)
 
-        text_encoder_3 = T5EncoderModel.from_pretrained("hf-internal-testing/tiny-random-t5")
+        torch.manual_seed(0)
+        config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-t5")
+        text_encoder_3 = T5EncoderModel(config)
 
         tokenizer = CLIPTokenizer.from_pretrained("hf-internal-testing/tiny-random-clip")
         tokenizer_2 = CLIPTokenizer.from_pretrained("hf-internal-testing/tiny-random-clip")
@@ -148,9 +158,9 @@ class StableDiffusion3PAGImg2ImgPipelineFastTests(unittest.TestCase, PipelineTes
 
         inputs = self.get_dummy_inputs(device)
         del inputs["pag_scale"]
-        assert (
-            "pag_scale" not in inspect.signature(pipe_sd.__call__).parameters
-        ), f"`pag_scale` should not be a call parameter of the base pipeline {pipe_sd.__class__.__name__}."
+        assert "pag_scale" not in inspect.signature(pipe_sd.__call__).parameters, (
+            f"`pag_scale` should not be a call parameter of the base pipeline {pipe_sd.__class__.__name__}."
+        )
         out = pipe_sd(**inputs).images[0, -3:, -3:, -1]
 
         components = self.get_dummy_components()
@@ -193,7 +203,7 @@ class StableDiffusion3PAGImg2ImgPipelineFastTests(unittest.TestCase, PipelineTes
 
 
 @slow
-@require_torch_gpu
+@require_torch_accelerator
 class StableDiffusion3PAGImg2ImgPipelineIntegrationTests(unittest.TestCase):
     pipeline_class = StableDiffusion3PAGImg2ImgPipeline
     repo_id = "stabilityai/stable-diffusion-3-medium-diffusers"
@@ -201,12 +211,12 @@ class StableDiffusion3PAGImg2ImgPipelineIntegrationTests(unittest.TestCase):
     def setUp(self):
         super().setUp()
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def tearDown(self):
         super().tearDown()
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def get_inputs(
         self, device, generator_device="cpu", dtype=torch.float32, seed=0, guidance_scale=7.0, pag_scale=0.7
@@ -233,7 +243,7 @@ class StableDiffusion3PAGImg2ImgPipelineIntegrationTests(unittest.TestCase):
         pipeline = AutoPipelineForImage2Image.from_pretrained(
             self.repo_id, enable_pag=True, torch_dtype=torch.float16, pag_applied_layers=["blocks.17"]
         )
-        pipeline.enable_model_cpu_offload()
+        pipeline.enable_model_cpu_offload(device=torch_device)
         pipeline.set_progress_bar_config(disable=None)
 
         inputs = self.get_inputs(torch_device)
@@ -253,15 +263,15 @@ class StableDiffusion3PAGImg2ImgPipelineIntegrationTests(unittest.TestCase):
                 0.17822266,
             ]
         )
-        assert (
-            np.abs(image_slice.flatten() - expected_slice).max() < 1e-3
-        ), f"output is different from expected, {image_slice.flatten()}"
+        assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-3, (
+            f"output is different from expected, {image_slice.flatten()}"
+        )
 
     def test_pag_uncond(self):
         pipeline = AutoPipelineForImage2Image.from_pretrained(
             self.repo_id, enable_pag=True, torch_dtype=torch.float16, pag_applied_layers=["blocks.(4|17)"]
         )
-        pipeline.enable_model_cpu_offload()
+        pipeline.enable_model_cpu_offload(device=torch_device)
         pipeline.set_progress_bar_config(disable=None)
 
         inputs = self.get_inputs(torch_device, guidance_scale=0.0, pag_scale=1.8)
@@ -271,6 +281,6 @@ class StableDiffusion3PAGImg2ImgPipelineIntegrationTests(unittest.TestCase):
         expected_slice = np.array(
             [0.1508789, 0.16210938, 0.17138672, 0.16210938, 0.17089844, 0.16137695, 0.16235352, 0.16430664, 0.16455078]
         )
-        assert (
-            np.abs(image_slice.flatten() - expected_slice).max() < 1e-3
-        ), f"output is different from expected, {image_slice.flatten()}"
+        assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-3, (
+            f"output is different from expected, {image_slice.flatten()}"
+        )

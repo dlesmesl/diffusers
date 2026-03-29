@@ -1,4 +1,4 @@
-# Copyright 2024 Alpha-VLLM and The HuggingFace Team. All rights reserved.
+# Copyright 2025 Alpha-VLLM and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,10 +17,10 @@ import inspect
 import math
 import re
 import urllib.parse as ul
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable
 
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import GemmaPreTrainedModel, GemmaTokenizer, GemmaTokenizerFast
 
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
 from ...image_processor import VaeImageProcessor
@@ -30,6 +30,7 @@ from ...models.transformers.lumina_nextdit2d import LuminaNextDiT2DModel
 from ...schedulers import FlowMatchEulerDiscreteScheduler
 from ...utils import (
     BACKENDS_MAPPING,
+    deprecate,
     is_bs4_available,
     is_ftfy_available,
     is_torch_xla_available,
@@ -60,11 +61,9 @@ EXAMPLE_DOC_STRING = """
     Examples:
         ```py
         >>> import torch
-        >>> from diffusers import LuminaText2ImgPipeline
+        >>> from diffusers import LuminaPipeline
 
-        >>> pipe = LuminaText2ImgPipeline.from_pretrained(
-        ...     "Alpha-VLLM/Lumina-Next-SFT-diffusers", torch_dtype=torch.bfloat16
-        ... )
+        >>> pipe = LuminaPipeline.from_pretrained("Alpha-VLLM/Lumina-Next-SFT-diffusers", torch_dtype=torch.bfloat16)
         >>> # Enable memory optimizations.
         >>> pipe.enable_model_cpu_offload()
 
@@ -77,10 +76,10 @@ EXAMPLE_DOC_STRING = """
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
 def retrieve_timesteps(
     scheduler,
-    num_inference_steps: Optional[int] = None,
-    device: Optional[Union[str, torch.device]] = None,
-    timesteps: Optional[List[int]] = None,
-    sigmas: Optional[List[float]] = None,
+    num_inference_steps: int | None = None,
+    device: str | torch.device | None = None,
+    timesteps: list[int] | None = None,
+    sigmas: list[float] | None = None,
     **kwargs,
 ):
     r"""
@@ -95,15 +94,15 @@ def retrieve_timesteps(
             must be `None`.
         device (`str` or `torch.device`, *optional*):
             The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
-        timesteps (`List[int]`, *optional*):
+        timesteps (`list[int]`, *optional*):
             Custom timesteps used to override the timestep spacing strategy of the scheduler. If `timesteps` is passed,
             `num_inference_steps` and `sigmas` must be `None`.
-        sigmas (`List[float]`, *optional*):
+        sigmas (`list[float]`, *optional*):
             Custom sigmas used to override the timestep spacing strategy of the scheduler. If `sigmas` is passed,
             `num_inference_steps` and `timesteps` must be `None`.
 
     Returns:
-        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+        `tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
         second element is the number of inference steps.
     """
     if timesteps is not None and sigmas is not None:
@@ -134,7 +133,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class LuminaText2ImgPipeline(DiffusionPipeline):
+class LuminaPipeline(DiffusionPipeline):
     r"""
     Pipeline for text-to-image generation using Lumina-T2I.
 
@@ -144,13 +143,10 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
     Args:
         vae ([`AutoencoderKL`]):
             Variational Auto-Encoder (VAE) Model to encode and decode images to and from latent representations.
-        text_encoder ([`AutoModel`]):
-            Frozen text-encoder. Lumina-T2I uses
-            [T5](https://huggingface.co/docs/transformers/model_doc/t5#transformers.AutoModel), specifically the
-            [t5-v1_1-xxl](https://huggingface.co/Alpha-VLLM/tree/main/t5-v1_1-xxl) variant.
-        tokenizer (`AutoModel`):
-            Tokenizer of class
-            [AutoModel](https://huggingface.co/docs/transformers/model_doc/t5#transformers.AutoModel).
+        text_encoder ([`GemmaPreTrainedModel`]):
+            Frozen Gemma text-encoder.
+        tokenizer (`GemmaTokenizer` or `GemmaTokenizerFast`):
+            Gemma tokenizer.
         transformer ([`Transformer2DModel`]):
             A text conditioned `Transformer2DModel` to denoise the encoded image latents.
         scheduler ([`SchedulerMixin`]):
@@ -185,8 +181,8 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
         transformer: LuminaNextDiT2DModel,
         scheduler: FlowMatchEulerDiscreteScheduler,
         vae: AutoencoderKL,
-        text_encoder: AutoModel,
-        tokenizer: AutoTokenizer,
+        text_encoder: GemmaPreTrainedModel,
+        tokenizer: GemmaTokenizer | GemmaTokenizerFast,
     ):
         super().__init__()
 
@@ -209,11 +205,11 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
 
     def _get_gemma_prompt_embeds(
         self,
-        prompt: Union[str, List[str]],
+        prompt: str | list[str],
         num_images_per_prompt: int = 1,
-        device: Optional[torch.device] = None,
-        clean_caption: Optional[bool] = False,
-        max_length: Optional[int] = None,
+        device: torch.device | None = None,
+        clean_caption: bool | None = False,
+        max_length: int | None = None,
     ):
         device = device or self._execution_device
         prompt = [prompt] if isinstance(prompt, str) else prompt
@@ -265,15 +261,15 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
     # Adapted from diffusers.pipelines.deepfloyd_if.pipeline_if.encode_prompt
     def encode_prompt(
         self,
-        prompt: Union[str, List[str]],
+        prompt: str | list[str],
         do_classifier_free_guidance: bool = True,
-        negative_prompt: Union[str, List[str]] = None,
+        negative_prompt: str | list[str] = None,
         num_images_per_prompt: int = 1,
-        device: Optional[torch.device] = None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        prompt_attention_mask: Optional[torch.Tensor] = None,
-        negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+        device: torch.device | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+        negative_prompt_attention_mask: torch.Tensor | None = None,
         clean_caption: bool = False,
         **kwargs,
     ):
@@ -281,9 +277,9 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
         Encodes the prompt into text encoder hidden states.
 
         Args:
-            prompt (`str` or `List[str]`, *optional*):
+            prompt (`str` or `list[str]`, *optional*):
                 prompt to be encoded
-            negative_prompt (`str` or `List[str]`, *optional*):
+            negative_prompt (`str` or `list[str]`, *optional*):
                 The prompt not to guide the image generation. If not defined, one has to pass `negative_prompt_embeds`
                 instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`). For
                 Lumina-T2I, this should be "".
@@ -376,7 +372,7 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
         # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+        # eta corresponds to η in DDIM paper: https://huggingface.co/papers/2010.02502
         # and should be between [0, 1]
 
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
@@ -538,7 +534,7 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
         # &amp
         caption = re.sub(r"&amp", "", caption)
 
-        # ip adresses:
+        # ip addresses:
         caption = re.sub(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", " ", caption)
 
         # article ids:
@@ -623,7 +619,7 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
         return self._guidance_scale
 
     # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-    # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+    # of the Imagen paper: https://huggingface.co/papers/2205.11487 . `guidance_scale = 1`
     # corresponds to doing no classifier free guidance.
     @property
     def do_classifier_free_guidance(self):
@@ -637,55 +633,53 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
-        prompt: Union[str, List[str]] = None,
-        width: Optional[int] = None,
-        height: Optional[int] = None,
+        prompt: str | list[str] = None,
+        width: int | None = None,
+        height: int | None = None,
         num_inference_steps: int = 30,
         guidance_scale: float = 4.0,
-        negative_prompt: Union[str, List[str]] = None,
-        sigmas: List[float] = None,
-        num_images_per_prompt: Optional[int] = 1,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.Tensor] = None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        prompt_attention_mask: Optional[torch.Tensor] = None,
-        negative_prompt_attention_mask: Optional[torch.Tensor] = None,
-        output_type: Optional[str] = "pil",
+        negative_prompt: str | list[str] = None,
+        sigmas: list[float] = None,
+        num_images_per_prompt: int | None = 1,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+        negative_prompt_attention_mask: torch.Tensor | None = None,
+        output_type: str | None = "pil",
         return_dict: bool = True,
         clean_caption: bool = True,
         max_sequence_length: int = 256,
-        scaling_watershed: Optional[float] = 1.0,
-        proportional_attn: Optional[bool] = True,
-        callback_on_step_end: Optional[
-            Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
-        ] = None,
-        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
-    ) -> Union[ImagePipelineOutput, Tuple]:
+        scaling_watershed: float | None = 1.0,
+        proportional_attn: bool | None = True,
+        callback_on_step_end: Callable[[int, int], None] | PipelineCallback | MultiPipelineCallbacks | None = None,
+        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
+    ) -> ImagePipelineOutput | tuple:
         """
         Function invoked when calling the pipeline for generation.
 
         Args:
-            prompt (`str` or `List[str]`, *optional*):
+            prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
                 instead.
-            negative_prompt (`str` or `List[str]`, *optional*):
+            negative_prompt (`str` or `list[str]`, *optional*):
                 The prompt or prompts not to guide the image generation. If not defined, one has to pass
                 `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
                 less than `1`).
             num_inference_steps (`int`, *optional*, defaults to 30):
                 The number of denoising steps. More denoising steps usually lead to a higher quality image at the
                 expense of slower inference.
-            sigmas (`List[float]`, *optional*):
+            sigmas (`list[float]`, *optional*):
                 Custom sigmas to use for the denoising process with schedulers which support a `sigmas` argument in
                 their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is passed
                 will be used.
             guidance_scale (`float`, *optional*, defaults to 4.0):
-                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
-                `guidance_scale` is defined as `w` of equation 2. of [Imagen
-                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
-                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
-                usually at the expense of lower image quality.
+                Guidance scale as defined in [Classifier-Free Diffusion
+                Guidance](https://huggingface.co/papers/2207.12598). `guidance_scale` is defined as `w` of equation 2.
+                of [Imagen Paper](https://huggingface.co/papers/2205.11487). Guidance scale is enabled by setting
+                `guidance_scale > 1`. Higher guidance scale encourages to generate images that are closely linked to
+                the text `prompt`, usually at the expense of lower image quality.
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             height (`int`, *optional*, defaults to self.unet.config.sample_size):
@@ -693,15 +687,15 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
             width (`int`, *optional*, defaults to self.unet.config.sample_size):
                 The width in pixels of the generated image.
             eta (`float`, *optional*, defaults to 0.0):
-                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
-                [`schedulers.DDIMScheduler`], will be ignored for others.
-            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                Corresponds to parameter eta (η) in the DDIM paper: https://huggingface.co/papers/2010.02502. Only
+                applies to [`schedulers.DDIMScheduler`], will be ignored for others.
+            generator (`torch.Generator` or `list[torch.Generator]`, *optional*):
                 One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
                 to make generation deterministic.
             latents (`torch.Tensor`, *optional*):
                 Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
                 generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                tensor will ge generated by sampling using the supplied random `generator`.
+                tensor will be generated by sampling using the supplied random `generator`.
             prompt_embeds (`torch.Tensor`, *optional*):
                 Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
                 provided, text embeddings will be generated from `prompt` input argument.
@@ -727,7 +721,7 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
                 with the following arguments: `callback_on_step_end(self: DiffusionPipeline, step: int, timestep: int,
                 callback_kwargs: Dict)`. `callback_kwargs` will include a list of all tensors as specified by
                 `callback_on_step_end_tensor_inputs`.
-            callback_on_step_end_tensor_inputs (`List`, *optional*):
+            callback_on_step_end_tensor_inputs (`list`, *optional*):
                 The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
                 will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
                 `._callback_tensor_inputs` attribute of your pipeline class.
@@ -775,7 +769,7 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
         device = self._execution_device
 
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # of the Imagen paper: https://huggingface.co/papers/2205.11487 . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
 
@@ -803,7 +797,13 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
             prompt_attention_mask = torch.cat([prompt_attention_mask, negative_prompt_attention_mask], dim=0)
 
         # 4. Prepare timesteps
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, sigmas=sigmas)
+        if XLA_AVAILABLE:
+            timestep_device = "cpu"
+        else:
+            timestep_device = device
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, num_inference_steps, timestep_device, sigmas=sigmas
+        )
 
         # 5. Prepare latents.
         latent_channels = self.transformer.config.in_channels
@@ -852,7 +852,7 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
                 # prepare image_rotary_emb for positional encoding
                 # dynamic scaling_factor for different resolution.
                 # NOTE: For `Time-aware` denosing mechanism from Lumina-Next
-                # https://arxiv.org/abs/2406.18583, Sec 2.3
+                # https://huggingface.co/papers/2406.18583, Sec 2.3
                 # NOTE: We should compute different image_rotary_emb with different timestep.
                 if current_timestep[0] < scaling_watershed:
                     linear_factor = scaling_factor
@@ -935,3 +935,23 @@ class LuminaText2ImgPipeline(DiffusionPipeline):
             return (image,)
 
         return ImagePipelineOutput(images=image)
+
+
+class LuminaText2ImgPipeline(LuminaPipeline):
+    def __init__(
+        self,
+        transformer: LuminaNextDiT2DModel,
+        scheduler: FlowMatchEulerDiscreteScheduler,
+        vae: AutoencoderKL,
+        text_encoder: GemmaPreTrainedModel,
+        tokenizer: GemmaTokenizer | GemmaTokenizerFast,
+    ):
+        deprecation_message = "`LuminaText2ImgPipeline` has been renamed to `LuminaPipeline` and will be removed in a future version. Please use `LuminaPipeline` instead."
+        deprecate("diffusers.pipelines.lumina.pipeline_lumina.LuminaText2ImgPipeline", "0.34", deprecation_message)
+        super().__init__(
+            transformer=transformer,
+            scheduler=scheduler,
+            vae=vae,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+        )

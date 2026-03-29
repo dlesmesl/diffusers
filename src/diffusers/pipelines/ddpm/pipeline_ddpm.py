@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,10 +13,10 @@
 # limitations under the License.
 
 
-from typing import List, Optional, Tuple, Union
-
 import torch
 
+from ...models import UNet2DModel
+from ...schedulers import DDPMScheduler
 from ...utils import is_torch_xla_available
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
@@ -47,7 +47,7 @@ class DDPMPipeline(DiffusionPipeline):
 
     model_cpu_offload_seq = "unet"
 
-    def __init__(self, unet, scheduler):
+    def __init__(self, unet: UNet2DModel, scheduler: DDPMScheduler):
         super().__init__()
         self.register_modules(unet=unet, scheduler=scheduler)
 
@@ -55,11 +55,11 @@ class DDPMPipeline(DiffusionPipeline):
     def __call__(
         self,
         batch_size: int = 1,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
         num_inference_steps: int = 1000,
-        output_type: Optional[str] = "pil",
+        output_type: str | None = "pil",
         return_dict: bool = True,
-    ) -> Union[ImagePipelineOutput, Tuple]:
+    ) -> ImagePipelineOutput | tuple:
         r"""
         The call function to the pipeline for generation.
 

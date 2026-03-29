@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 HuggingFace Inc.
+# Copyright 2025 HuggingFace Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@ import tempfile
 import unittest
 
 import numpy as np
-import pytest
 import safetensors.torch
 import torch
 from parameterized import parameterized
@@ -29,15 +28,17 @@ from transformers import AutoTokenizer, CLIPTextModel, CLIPTokenizer, T5EncoderM
 
 from diffusers import FlowMatchEulerDiscreteScheduler, FluxControlPipeline, FluxPipeline, FluxTransformer2DModel
 from diffusers.utils import load_image, logging
-from diffusers.utils.testing_utils import (
+
+from ..testing_utils import (
     CaptureLogger,
+    backend_empty_cache,
     floats_tensor,
     is_peft_available,
     nightly,
     numpy_cosine_similarity_distance,
-    require_big_gpu_with_torch_cuda,
+    require_big_accelerator,
     require_peft_backend,
-    require_torch_gpu,
+    require_torch_accelerator,
     slow,
     torch_device,
 )
@@ -48,15 +49,14 @@ if is_peft_available():
 
 sys.path.append(".")
 
-from utils import PeftLoraLoaderMixinTests, check_if_lora_correctly_set  # noqa: E402
+from .utils import PeftLoraLoaderMixinTests, check_if_lora_correctly_set  # noqa: E402
 
 
 @require_peft_backend
 class FluxLoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
     pipeline_class = FluxPipeline
-    scheduler_cls = FlowMatchEulerDiscreteScheduler()
+    scheduler_cls = FlowMatchEulerDiscreteScheduler
     scheduler_kwargs = {}
-    scheduler_classes = [FlowMatchEulerDiscreteScheduler]
     transformer_kwargs = {
         "patch_size": 1,
         "in_channels": 4,
@@ -122,9 +122,6 @@ class FluxLoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
         pipe.set_progress_bar_config(disable=None)
         _, _, inputs = self.get_dummy_inputs(with_generator=False)
 
-        output_no_lora = pipe(**inputs, generator=torch.manual_seed(0)).images
-        self.assertTrue(output_no_lora.shape == self.output_shape)
-
         pipe.transformer.add_adapter(denoiser_lora_config)
         self.assertTrue(check_if_lora_correctly_set(pipe.transformer), "Lora not correctly set in transformer")
 
@@ -170,8 +167,7 @@ class FluxLoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
         pipe.set_progress_bar_config(disable=None)
         _, _, inputs = self.get_dummy_inputs(with_generator=False)
 
-        output_no_lora = pipe(**inputs, generator=torch.manual_seed(0)).images
-        self.assertTrue(output_no_lora.shape == self.output_shape)
+        output_no_lora = self.get_base_pipe_output()
 
         # Modify the config to have a layer which won't be present in the second LoRA we will load.
         modified_denoiser_lora_config = copy.deepcopy(denoiser_lora_config)
@@ -218,9 +214,7 @@ class FluxLoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
         pipe = pipe.to(torch_device)
         pipe.set_progress_bar_config(disable=None)
         _, _, inputs = self.get_dummy_inputs(with_generator=False)
-
-        output_no_lora = pipe(**inputs, generator=torch.manual_seed(0)).images
-        self.assertTrue(output_no_lora.shape == self.output_shape)
+        output_no_lora = self.get_base_pipe_output()
 
         # Modify the config to have a layer which won't be present in the first LoRA we will load.
         modified_denoiser_lora_config = copy.deepcopy(denoiser_lora_config)
@@ -263,6 +257,10 @@ class FluxLoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
         )
 
     @unittest.skip("Not supported in Flux.")
+    def test_simple_inference_with_text_denoiser_block_scale(self):
+        pass
+
+    @unittest.skip("Not supported in Flux.")
     def test_simple_inference_with_text_denoiser_block_scale_for_all_dict_options(self):
         pass
 
@@ -270,12 +268,15 @@ class FluxLoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
     def test_modify_padding_mode(self):
         pass
 
+    @unittest.skip("Not supported in Flux.")
+    def test_simple_inference_with_text_denoiser_multi_adapter_block_lora(self):
+        pass
+
 
 class FluxControlLoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
     pipeline_class = FluxControlPipeline
-    scheduler_cls = FlowMatchEulerDiscreteScheduler()
+    scheduler_cls = FlowMatchEulerDiscreteScheduler
     scheduler_kwargs = {}
-    scheduler_classes = [FlowMatchEulerDiscreteScheduler]
     transformer_kwargs = {
         "patch_size": 1,
         "in_channels": 8,
@@ -322,6 +323,7 @@ class FluxControlLoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
         noise = floats_tensor((batch_size, num_channels) + sizes)
         input_ids = torch.randint(1, sequence_length, size=(batch_size, sequence_length), generator=generator)
 
+        np.random.seed(0)
         pipeline_inputs = {
             "prompt": "A painting of a squirrel eating a burger",
             "control_image": Image.fromarray(np.random.randint(0, 255, size=(32, 32, 3), dtype="uint8")),
@@ -363,9 +365,8 @@ class FluxControlLoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
                 lora_load_output = pipe(**inputs, generator=torch.manual_seed(0))[0]
 
                 self.assertTrue(
-                    cap_logger.out.startswith(
-                        "The provided state dict contains normalization layers in addition to LoRA layers"
-                    )
+                    "The provided state dict contains normalization layers in addition to LoRA layers"
+                    in cap_logger.out
                 )
                 self.assertTrue(len(pipe.transformer._transformer_norm_layers) > 0)
 
@@ -384,7 +385,7 @@ class FluxControlLoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
             pipe.load_lora_weights(norm_state_dict)
 
         self.assertTrue(
-            cap_logger.out.startswith("Unsupported keys found in state dict when trying to load normalization layers")
+            "Unsupported keys found in state dict when trying to load normalization layers" in cap_logger.out
         )
 
     def test_lora_parameter_expanded_shapes(self):
@@ -784,6 +785,10 @@ class FluxControlLoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
         self.assertTrue(pipe.transformer.config.in_channels == in_features * 2)
 
     @unittest.skip("Not supported in Flux.")
+    def test_simple_inference_with_text_denoiser_block_scale(self):
+        pass
+
+    @unittest.skip("Not supported in Flux.")
     def test_simple_inference_with_text_denoiser_block_scale_for_all_dict_options(self):
         pass
 
@@ -791,13 +796,16 @@ class FluxControlLoRATests(unittest.TestCase, PeftLoraLoaderMixinTests):
     def test_modify_padding_mode(self):
         pass
 
+    @unittest.skip("Not supported in Flux.")
+    def test_simple_inference_with_text_denoiser_multi_adapter_block_lora(self):
+        pass
+
 
 @slow
 @nightly
-@require_torch_gpu
+@require_torch_accelerator
 @require_peft_backend
-@require_big_gpu_with_torch_cuda
-@pytest.mark.big_gpu_with_torch_cuda
+@require_big_accelerator
 class FluxLoRAIntegrationTests(unittest.TestCase):
     """internal note: The integration slices were obtained on audace.
 
@@ -812,7 +820,7 @@ class FluxLoRAIntegrationTests(unittest.TestCase):
         super().setUp()
 
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
         self.pipeline = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16)
 
@@ -821,13 +829,13 @@ class FluxLoRAIntegrationTests(unittest.TestCase):
 
         del self.pipeline
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def test_flux_the_last_ben(self):
         self.pipeline.load_lora_weights("TheLastBen/Jon_Snow_Flux_LoRA", weight_name="jon_snow.safetensors")
         self.pipeline.fuse_lora()
         self.pipeline.unload_lora_weights()
-        # Instead of calling `enable_model_cpu_offload()`, we do a cuda placement here because the CI
+        # Instead of calling `enable_model_cpu_offload()`, we do a accelerator placement here because the CI
         # run supports it. We have about 34GB RAM in the CI runner which kills the test when run with
         # `enable_model_cpu_offload()`. We repeat this for the other tests, too.
         self.pipeline = self.pipeline.to(torch_device)
@@ -892,6 +900,13 @@ class FluxLoRAIntegrationTests(unittest.TestCase):
 
         assert max_diff < 1e-3
 
+    def test_flux_kohya_embedders_conversion(self):
+        """Test that embedders load without throwing errors"""
+        self.pipeline.load_lora_weights("rockerBOO/flux-bpo-po-lora")
+        self.pipeline.unload_lora_weights()
+
+        assert True
+
     def test_flux_xlabs(self):
         self.pipeline.load_lora_weights("XLabs-AI/flux-lora-collection", weight_name="disney_lora.safetensors")
         self.pipeline.fuse_lora()
@@ -941,10 +956,9 @@ class FluxLoRAIntegrationTests(unittest.TestCase):
 
 
 @nightly
-@require_torch_gpu
+@require_torch_accelerator
 @require_peft_backend
-@require_big_gpu_with_torch_cuda
-@pytest.mark.big_gpu_with_torch_cuda
+@require_big_accelerator
 class FluxControlLoRAIntegrationTests(unittest.TestCase):
     num_inference_steps = 10
     seed = 0
@@ -954,17 +968,17 @@ class FluxControlLoRAIntegrationTests(unittest.TestCase):
         super().setUp()
 
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
         self.pipeline = FluxControlPipeline.from_pretrained(
             "black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16
-        ).to("cuda")
+        ).to(torch_device)
 
     def tearDown(self):
         super().tearDown()
 
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     @parameterized.expand(["black-forest-labs/FLUX.1-Canny-dev-lora", "black-forest-labs/FLUX.1-Depth-dev-lora"])
     def test_lora(self, lora_ckpt_id):

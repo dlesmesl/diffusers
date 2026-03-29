@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 HuggingFace Inc and The InstantX Team.
+# Copyright 2025 HuggingFace Inc and The InstantX Team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,12 +15,17 @@
 
 import gc
 import unittest
-from typing import Optional
 
 import numpy as np
-import pytest
 import torch
-from transformers import AutoTokenizer, CLIPTextConfig, CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    CLIPTextConfig,
+    CLIPTextModelWithProjection,
+    CLIPTokenizer,
+    T5EncoderModel,
+)
 
 from diffusers import (
     AutoencoderKL,
@@ -30,15 +35,16 @@ from diffusers import (
 )
 from diffusers.models import SD3ControlNetModel, SD3MultiControlNetModel
 from diffusers.utils import load_image
-from diffusers.utils.testing_utils import (
+from diffusers.utils.torch_utils import randn_tensor
+
+from ...testing_utils import (
+    backend_empty_cache,
     enable_full_determinism,
     numpy_cosine_similarity_distance,
-    require_big_gpu_with_torch_cuda,
+    require_big_accelerator,
     slow,
     torch_device,
 )
-from diffusers.utils.torch_utils import randn_tensor
-
 from ..test_pipelines_common import PipelineTesterMixin
 
 
@@ -63,7 +69,7 @@ class StableDiffusion3ControlNetPipelineFastTests(unittest.TestCase, PipelineTes
     test_group_offloading = True
 
     def get_dummy_components(
-        self, num_controlnet_layers: int = 3, qk_norm: Optional[str] = "rms_norm", use_dual_attention=False
+        self, num_controlnet_layers: int = 3, qk_norm: str | None = "rms_norm", use_dual_attention=False
     ):
         torch.manual_seed(0)
         transformer = SD3Transformer2DModel(
@@ -118,7 +124,8 @@ class StableDiffusion3ControlNetPipelineFastTests(unittest.TestCase, PipelineTes
         text_encoder_2 = CLIPTextModelWithProjection(clip_text_encoder_config)
 
         torch.manual_seed(0)
-        text_encoder_3 = T5EncoderModel.from_pretrained("hf-internal-testing/tiny-random-t5")
+        config = AutoConfig.from_pretrained("hf-internal-testing/tiny-random-t5")
+        text_encoder_3 = T5EncoderModel(config)
 
         tokenizer = CLIPTokenizer.from_pretrained("hf-internal-testing/tiny-random-clip")
         tokenizer_2 = CLIPTokenizer.from_pretrained("hf-internal-testing/tiny-random-clip")
@@ -201,9 +208,9 @@ class StableDiffusion3ControlNetPipelineFastTests(unittest.TestCase, PipelineTes
         else:
             expected_slice = np.array([1.0000, 0.9072, 0.4209, 0.2744, 0.5737, 0.3840, 0.6113, 0.6250, 0.6328])
 
-        assert (
-            np.abs(image_slice.flatten() - expected_slice).max() < 1e-2
-        ), f"Expected: {expected_slice}, got: {image_slice.flatten()}"
+        assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-2, (
+            f"Expected: {expected_slice}, got: {image_slice.flatten()}"
+        )
 
     def test_controlnet_sd3(self):
         components = self.get_dummy_components()
@@ -219,27 +226,26 @@ class StableDiffusion3ControlNetPipelineFastTests(unittest.TestCase, PipelineTes
 
 
 @slow
-@require_big_gpu_with_torch_cuda
-@pytest.mark.big_gpu_with_torch_cuda
+@require_big_accelerator
 class StableDiffusion3ControlNetPipelineSlowTests(unittest.TestCase):
     pipeline_class = StableDiffusion3ControlNetPipeline
 
     def setUp(self):
         super().setUp()
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def tearDown(self):
         super().tearDown()
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
 
     def test_canny(self):
         controlnet = SD3ControlNetModel.from_pretrained("InstantX/SD3-Controlnet-Canny", torch_dtype=torch.float16)
         pipe = StableDiffusion3ControlNetPipeline.from_pretrained(
             "stabilityai/stable-diffusion-3-medium-diffusers", controlnet=controlnet, torch_dtype=torch.float16
         )
-        pipe.enable_model_cpu_offload()
+        pipe.enable_model_cpu_offload(device=torch_device)
         pipe.set_progress_bar_config(disable=None)
 
         generator = torch.Generator(device="cpu").manual_seed(0)
@@ -272,7 +278,7 @@ class StableDiffusion3ControlNetPipelineSlowTests(unittest.TestCase):
         pipe = StableDiffusion3ControlNetPipeline.from_pretrained(
             "stabilityai/stable-diffusion-3-medium-diffusers", controlnet=controlnet, torch_dtype=torch.float16
         )
-        pipe.enable_model_cpu_offload()
+        pipe.enable_model_cpu_offload(device=torch_device)
         pipe.set_progress_bar_config(disable=None)
 
         generator = torch.Generator(device="cpu").manual_seed(0)
@@ -304,7 +310,7 @@ class StableDiffusion3ControlNetPipelineSlowTests(unittest.TestCase):
         pipe = StableDiffusion3ControlNetPipeline.from_pretrained(
             "stabilityai/stable-diffusion-3-medium-diffusers", controlnet=controlnet, torch_dtype=torch.float16
         )
-        pipe.enable_model_cpu_offload()
+        pipe.enable_model_cpu_offload(device=torch_device)
         pipe.set_progress_bar_config(disable=None)
 
         generator = torch.Generator(device="cpu").manual_seed(0)
@@ -338,7 +344,7 @@ class StableDiffusion3ControlNetPipelineSlowTests(unittest.TestCase):
         pipe = StableDiffusion3ControlNetPipeline.from_pretrained(
             "stabilityai/stable-diffusion-3-medium-diffusers", controlnet=controlnet, torch_dtype=torch.float16
         )
-        pipe.enable_model_cpu_offload()
+        pipe.enable_model_cpu_offload(device=torch_device)
         pipe.set_progress_bar_config(disable=None)
 
         generator = torch.Generator(device="cpu").manual_seed(0)

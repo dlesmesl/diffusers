@@ -21,8 +21,9 @@ from ..configuration_utils import ConfigMixin
 from ..models.controlnets import ControlNetUnionModel
 from ..utils import is_sentencepiece_available
 from .aura_flow import AuraFlowPipeline
+from .chroma import ChromaPipeline
 from .cogview3 import CogView3PlusPipeline
-from .cogview4 import CogView4Pipeline
+from .cogview4 import CogView4ControlPipeline, CogView4Pipeline
 from .controlnet import (
     StableDiffusionControlNetImg2ImgPipeline,
     StableDiffusionControlNetInpaintPipeline,
@@ -34,6 +35,10 @@ from .controlnet import (
     StableDiffusionXLControlNetUnionInpaintPipeline,
     StableDiffusionXLControlNetUnionPipeline,
 )
+from .controlnet_sd3 import (
+    StableDiffusion3ControlNetInpaintingPipeline,
+    StableDiffusion3ControlNetPipeline,
+)
 from .deepfloyd_if import IFImg2ImgPipeline, IFInpaintingPipeline, IFPipeline
 from .flux import (
     FluxControlImg2ImgPipeline,
@@ -44,8 +49,12 @@ from .flux import (
     FluxControlPipeline,
     FluxImg2ImgPipeline,
     FluxInpaintPipeline,
+    FluxKontextPipeline,
     FluxPipeline,
 )
+from .flux2 import Flux2KleinPipeline, Flux2Pipeline
+from .glm_image import GlmImagePipeline
+from .helios import HeliosPipeline, HeliosPyramidPipeline
 from .hunyuandit import HunyuanDiTPipeline
 from .kandinsky import (
     KandinskyCombinedPipeline,
@@ -65,8 +74,9 @@ from .kandinsky2_2 import (
 )
 from .kandinsky3 import Kandinsky3Img2ImgPipeline, Kandinsky3Pipeline
 from .latent_consistency_models import LatentConsistencyModelImg2ImgPipeline, LatentConsistencyModelPipeline
-from .lumina import LuminaText2ImgPipeline
-from .lumina2 import Lumina2Text2ImgPipeline
+from .lumina import LuminaPipeline
+from .lumina2 import Lumina2Pipeline
+from .ovis_image import OvisImagePipeline
 from .pag import (
     HunyuanDiTPAGPipeline,
     PixArtSigmaPAGPipeline,
@@ -85,6 +95,17 @@ from .pag import (
     StableDiffusionXLPAGPipeline,
 )
 from .pixart_alpha import PixArtAlphaPipeline, PixArtSigmaPipeline
+from .prx import PRXPipeline
+from .qwenimage import (
+    QwenImageControlNetPipeline,
+    QwenImageEditInpaintPipeline,
+    QwenImageEditPipeline,
+    QwenImageEditPlusPipeline,
+    QwenImageImg2ImgPipeline,
+    QwenImageInpaintPipeline,
+    QwenImageLayeredPipeline,
+    QwenImagePipeline,
+)
 from .sana import SanaPipeline
 from .stable_cascade import StableCascadeCombinedPipeline, StableCascadeDecoderPipeline
 from .stable_diffusion import (
@@ -102,7 +123,16 @@ from .stable_diffusion_xl import (
     StableDiffusionXLInpaintPipeline,
     StableDiffusionXLPipeline,
 )
+from .wan import WanImageToVideoPipeline, WanPipeline, WanVideoToVideoPipeline
 from .wuerstchen import WuerstchenCombinedPipeline, WuerstchenDecoderPipeline
+from .z_image import (
+    ZImageControlNetInpaintPipeline,
+    ZImageControlNetPipeline,
+    ZImageImg2ImgPipeline,
+    ZImageInpaintPipeline,
+    ZImageOmniPipeline,
+    ZImagePipeline,
+)
 
 
 AUTO_TEXT2IMAGE_PIPELINES_MAPPING = OrderedDict(
@@ -120,6 +150,7 @@ AUTO_TEXT2IMAGE_PIPELINES_MAPPING = OrderedDict(
         ("stable-diffusion-controlnet", StableDiffusionControlNetPipeline),
         ("stable-diffusion-xl-controlnet", StableDiffusionXLControlNetPipeline),
         ("stable-diffusion-xl-controlnet-union", StableDiffusionXLControlNetUnionPipeline),
+        ("stable-diffusion-3-controlnet", StableDiffusion3ControlNetPipeline),
         ("wuerstchen", WuerstchenCombinedPipeline),
         ("cascade", StableCascadeCombinedPipeline),
         ("lcm", LatentConsistencyModelPipeline),
@@ -136,10 +167,26 @@ AUTO_TEXT2IMAGE_PIPELINES_MAPPING = OrderedDict(
         ("flux", FluxPipeline),
         ("flux-control", FluxControlPipeline),
         ("flux-controlnet", FluxControlNetPipeline),
-        ("lumina", LuminaText2ImgPipeline),
-        ("lumina2", Lumina2Text2ImgPipeline),
+        ("flux-kontext", FluxKontextPipeline),
+        ("flux2-klein", Flux2KleinPipeline),
+        ("flux2", Flux2Pipeline),
+        ("lumina", LuminaPipeline),
+        ("lumina2", Lumina2Pipeline),
+        ("chroma", ChromaPipeline),
         ("cogview3", CogView3PlusPipeline),
         ("cogview4", CogView4Pipeline),
+        ("glm_image", GlmImagePipeline),
+        ("helios", HeliosPipeline),
+        ("helios-pyramid", HeliosPyramidPipeline),
+        ("cogview4-control", CogView4ControlPipeline),
+        ("qwenimage", QwenImagePipeline),
+        ("qwenimage-controlnet", QwenImageControlNetPipeline),
+        ("z-image", ZImagePipeline),
+        ("z-image-controlnet", ZImageControlNetPipeline),
+        ("z-image-controlnet-inpaint", ZImageControlNetInpaintPipeline),
+        ("z-image-omni", ZImageOmniPipeline),
+        ("ovis", OvisImagePipeline),
+        ("prx", PRXPipeline),
     ]
 )
 
@@ -163,6 +210,14 @@ AUTO_IMAGE2IMAGE_PIPELINES_MAPPING = OrderedDict(
         ("flux", FluxImg2ImgPipeline),
         ("flux-controlnet", FluxControlNetImg2ImgPipeline),
         ("flux-control", FluxControlImg2ImgPipeline),
+        ("flux-kontext", FluxKontextPipeline),
+        ("flux2-klein", Flux2KleinPipeline),
+        ("flux2", Flux2Pipeline),
+        ("qwenimage", QwenImageImg2ImgPipeline),
+        ("qwenimage-edit", QwenImageEditPipeline),
+        ("qwenimage-edit-plus", QwenImageEditPlusPipeline),
+        ("qwenimage-layered", QwenImageLayeredPipeline),
+        ("z-image", ZImageImg2ImgPipeline),
     ]
 )
 
@@ -178,11 +233,33 @@ AUTO_INPAINT_PIPELINES_MAPPING = OrderedDict(
         ("stable-diffusion-controlnet-pag", StableDiffusionControlNetPAGInpaintPipeline),
         ("stable-diffusion-xl-controlnet", StableDiffusionXLControlNetInpaintPipeline),
         ("stable-diffusion-xl-controlnet-union", StableDiffusionXLControlNetUnionInpaintPipeline),
+        ("stable-diffusion-3-controlnet", StableDiffusion3ControlNetInpaintingPipeline),
         ("stable-diffusion-xl-pag", StableDiffusionXLPAGInpaintPipeline),
         ("flux", FluxInpaintPipeline),
         ("flux-controlnet", FluxControlNetInpaintPipeline),
         ("flux-control", FluxControlInpaintPipeline),
         ("stable-diffusion-pag", StableDiffusionPAGInpaintPipeline),
+        ("qwenimage", QwenImageInpaintPipeline),
+        ("qwenimage-edit", QwenImageEditInpaintPipeline),
+        ("z-image", ZImageInpaintPipeline),
+    ]
+)
+
+AUTO_TEXT2VIDEO_PIPELINES_MAPPING = OrderedDict(
+    [
+        ("wan", WanPipeline),
+    ]
+)
+
+AUTO_IMAGE2VIDEO_PIPELINES_MAPPING = OrderedDict(
+    [
+        ("wan-i2v", WanImageToVideoPipeline),
+    ]
+)
+
+AUTO_VIDEO2VIDEO_PIPELINES_MAPPING = OrderedDict(
+    [
+        ("wan", WanVideoToVideoPipeline),
     ]
 )
 
@@ -219,6 +296,9 @@ SUPPORTED_TASKS_MAPPINGS = [
     AUTO_TEXT2IMAGE_PIPELINES_MAPPING,
     AUTO_IMAGE2IMAGE_PIPELINES_MAPPING,
     AUTO_INPAINT_PIPELINES_MAPPING,
+    AUTO_TEXT2VIDEO_PIPELINES_MAPPING,
+    AUTO_IMAGE2VIDEO_PIPELINES_MAPPING,
+    AUTO_VIDEO2VIDEO_PIPELINES_MAPPING,
     _AUTO_TEXT2IMAGE_DECODER_PIPELINES_MAPPING,
     _AUTO_IMAGE2IMAGE_DECODER_PIPELINES_MAPPING,
     _AUTO_INPAINT_DECODER_PIPELINES_MAPPING,
@@ -239,14 +319,15 @@ def _get_connected_pipeline(pipeline_cls):
         return _get_task_class(AUTO_INPAINT_PIPELINES_MAPPING, pipeline_cls.__name__, throw_error_if_not_exist=False)
 
 
-def _get_task_class(mapping, pipeline_class_name, throw_error_if_not_exist: bool = True):
-    def get_model(pipeline_class_name):
-        for task_mapping in SUPPORTED_TASKS_MAPPINGS:
-            for model_name, pipeline in task_mapping.items():
-                if pipeline.__name__ == pipeline_class_name:
-                    return model_name
+def _get_model(pipeline_class_name):
+    for task_mapping in SUPPORTED_TASKS_MAPPINGS:
+        for model_name, pipeline in task_mapping.items():
+            if pipeline.__name__ == pipeline_class_name:
+                return model_name
 
-    model_name = get_model(pipeline_class_name)
+
+def _get_task_class(mapping, pipeline_class_name, throw_error_if_not_exist: bool = True):
+    model_name = _get_model(pipeline_class_name)
 
     if model_name is not None:
         task_class = mapping.get(model_name, None)
@@ -315,17 +396,16 @@ class AutoPipelineForText2Image(ConfigMixin):
                     - A path to a *directory* (for example `./my_pipeline_directory/`) containing pipeline weights
                       saved using
                     [`~DiffusionPipeline.save_pretrained`].
-            torch_dtype (`str` or `torch.dtype`, *optional*):
-                Override the default `torch.dtype` and load the model with another dtype. If "auto" is passed, the
-                dtype is automatically derived from the model's weights.
+            torch_dtype (`torch.dtype`, *optional*):
+                Override the default `torch.dtype` and load the model with another dtype.
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
-            cache_dir (`Union[str, os.PathLike]`, *optional*):
+            cache_dir (`str | os.PathLike`, *optional*):
                 Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
                 is not used.
 
-            proxies (`Dict[str, str]`, *optional*):
+            proxies (`dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
             output_loading_info(`bool`, *optional*, defaults to `False`):
@@ -347,7 +427,7 @@ class AutoPipelineForText2Image(ConfigMixin):
                 Mirror source to resolve accessibility issues if you’re downloading a model in China. We do not
                 guarantee the timeliness or safety of the source, and you should refer to the mirror site for more
                 information.
-            device_map (`str` or `Dict[str, Union[int, str, torch.device]]`, *optional*):
+            device_map (`str` or `dict[str, int | str | torch.device]`, *optional*):
                 A map that specifies where each submodule should go. It doesn’t need to be defined for each
                 parameter/buffer name; once a given module name is inside, every submodule of it will be sent to the
                 same device.
@@ -381,12 +461,8 @@ class AutoPipelineForText2Image(ConfigMixin):
                 Load weights from a specified variant filename such as `"fp16"` or `"ema"`. This is ignored when
                 loading `from_flax`.
 
-        <Tip>
-
-        To use private or [gated](https://huggingface.co/docs/hub/models-gated#gated-models) models, log-in with
-        `huggingface-cli login`.
-
-        </Tip>
+        > [!TIP] > To use private or [gated](https://huggingface.co/docs/hub/models-gated#gated-models) models, log-in
+        with `hf > auth login`.
 
         Examples:
 
@@ -612,16 +688,15 @@ class AutoPipelineForImage2Image(ConfigMixin):
                       saved using
                     [`~DiffusionPipeline.save_pretrained`].
             torch_dtype (`str` or `torch.dtype`, *optional*):
-                Override the default `torch.dtype` and load the model with another dtype. If "auto" is passed, the
-                dtype is automatically derived from the model's weights.
+                Override the default `torch.dtype` and load the model with another dtype.
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
-            cache_dir (`Union[str, os.PathLike]`, *optional*):
+            cache_dir (`str | os.PathLike`, *optional*):
                 Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
                 is not used.
 
-            proxies (`Dict[str, str]`, *optional*):
+            proxies (`dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
             output_loading_info(`bool`, *optional*, defaults to `False`):
@@ -643,7 +718,7 @@ class AutoPipelineForImage2Image(ConfigMixin):
                 Mirror source to resolve accessibility issues if you’re downloading a model in China. We do not
                 guarantee the timeliness or safety of the source, and you should refer to the mirror site for more
                 information.
-            device_map (`str` or `Dict[str, Union[int, str, torch.device]]`, *optional*):
+            device_map (`str` or `dict[str, int | str | torch.device]`, *optional*):
                 A map that specifies where each submodule should go. It doesn’t need to be defined for each
                 parameter/buffer name; once a given module name is inside, every submodule of it will be sent to the
                 same device.
@@ -677,12 +752,8 @@ class AutoPipelineForImage2Image(ConfigMixin):
                 Load weights from a specified variant filename such as `"fp16"` or `"ema"`. This is ignored when
                 loading `from_flax`.
 
-        <Tip>
-
-        To use private or [gated](https://huggingface.co/docs/hub/models-gated#gated-models) models, log-in with
-        `huggingface-cli login`.
-
-        </Tip>
+        > [!TIP] > To use private or [gated](https://huggingface.co/docs/hub/models-gated#gated-models) models, log-in
+        with `hf > auth login`.
 
         Examples:
 
@@ -923,16 +994,15 @@ class AutoPipelineForInpainting(ConfigMixin):
                       saved using
                     [`~DiffusionPipeline.save_pretrained`].
             torch_dtype (`str` or `torch.dtype`, *optional*):
-                Override the default `torch.dtype` and load the model with another dtype. If "auto" is passed, the
-                dtype is automatically derived from the model's weights.
+                Override the default `torch.dtype` and load the model with another dtype.
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
-            cache_dir (`Union[str, os.PathLike]`, *optional*):
+            cache_dir (`str | os.PathLike`, *optional*):
                 Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
                 is not used.
 
-            proxies (`Dict[str, str]`, *optional*):
+            proxies (`dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
             output_loading_info(`bool`, *optional*, defaults to `False`):
@@ -954,7 +1024,7 @@ class AutoPipelineForInpainting(ConfigMixin):
                 Mirror source to resolve accessibility issues if you’re downloading a model in China. We do not
                 guarantee the timeliness or safety of the source, and you should refer to the mirror site for more
                 information.
-            device_map (`str` or `Dict[str, Union[int, str, torch.device]]`, *optional*):
+            device_map (`str` or `dict[str, int | str | torch.device]`, *optional*):
                 A map that specifies where each submodule should go. It doesn’t need to be defined for each
                 parameter/buffer name; once a given module name is inside, every submodule of it will be sent to the
                 same device.
@@ -988,12 +1058,8 @@ class AutoPipelineForInpainting(ConfigMixin):
                 Load weights from a specified variant filename such as `"fp16"` or `"ema"`. This is ignored when
                 loading `from_flax`.
 
-        <Tip>
-
-        To use private or [gated](https://huggingface.co/docs/hub/models-gated#gated-models) models, log-in with
-        `huggingface-cli login`.
-
-        </Tip>
+        > [!TIP] > To use private or [gated](https://huggingface.co/docs/hub/models-gated#gated-models) models, log-in
+        with `hf > auth login`.
 
         Examples:
 

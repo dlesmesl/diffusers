@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import torch
 from huggingface_hub import snapshot_download
 from huggingface_hub.utils import LocalEntryNotFoundError, validate_hf_hub_args
 from packaging import version
+from typing_extensions import Self
 
 from ..utils import deprecate, is_transformers_available, logging
 from .single_file_utils import (
@@ -269,7 +270,7 @@ class FromSingleFileMixin:
 
     @classmethod
     @validate_hf_hub_args
-    def from_single_file(cls, pretrained_model_link_or_path, **kwargs):
+    def from_single_file(cls, pretrained_model_link_or_path, **kwargs) -> Self:
         r"""
         Instantiate a [`DiffusionPipeline`] from pretrained pipeline weights saved in the `.ckpt` or `.safetensors`
         format. The pipeline is set in evaluation mode (`model.eval()`) by default.
@@ -285,11 +286,11 @@ class FromSingleFileMixin:
             force_download (`bool`, *optional*, defaults to `False`):
                 Whether or not to force the (re-)download of the model weights and configuration files, overriding the
                 cached versions if they exist.
-            cache_dir (`Union[str, os.PathLike]`, *optional*):
+            cache_dir (`str | os.PathLike`, *optional*):
                 Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
                 is not used.
 
-            proxies (`Dict[str, str]`, *optional*):
+            proxies (`dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, for example, `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
             local_files_only (`bool`, *optional*, defaults to `False`):
@@ -363,6 +364,12 @@ class FromSingleFileMixin:
         disable_mmap = kwargs.pop("disable_mmap", False)
 
         is_legacy_loading = False
+
+        if torch_dtype is not None and not isinstance(torch_dtype, torch.dtype):
+            torch_dtype = torch.float32
+            logger.warning(
+                f"Passed `torch_dtype` {torch_dtype} is not a `torch.dtype`. Defaulting to `torch.float32`."
+            )
 
         # We shouldn't allow configuring individual models components through a Pipeline creation method
         # These model kwargs should be deprecated
@@ -446,7 +453,7 @@ class FromSingleFileMixin:
                     logger.warning(
                         "Detected legacy `from_single_file` loading behavior. Attempting to create the pipeline based on inferred components.\n"
                         "This may lead to errors if the model components are not correctly inferred. \n"
-                        "To avoid this warning, please explicity pass the `config` argument to `from_single_file` with a path to a local diffusers model repo \n"
+                        "To avoid this warning, please explicitly pass the `config` argument to `from_single_file` with a path to a local diffusers model repo \n"
                         "e.g. `from_single_file(<my model checkpoint path>, config=<path to local diffusers model repo>) \n"
                         "or run `from_single_file` with `local_files_only=False` first to update the local cache directory with "
                         "the necessary config files.\n"
