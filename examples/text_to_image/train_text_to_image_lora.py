@@ -21,6 +21,7 @@ import math
 import os
 import random
 import shutil
+import csv
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -146,6 +147,19 @@ def log_validation(
                     ]
                 }
             )
+
+    # Save validation images to disk
+    validation_dir = os.path.join(args.output_dir, "validation_images")
+    os.makedirs(validation_dir, exist_ok=True)
+    phase_name = "final_validation" if is_final_validation else "validation"
+    for i, image in enumerate(images):
+        image_path = os.path.join(
+            validation_dir,
+            f"{phase_name}_epoch_{epoch:06d}_image_{i:02d}.png"
+        )
+        image.save(image_path)
+        logger.info(f"Saved {phase_name} image to {image_path}")
+
     return images
 
 
@@ -687,7 +701,16 @@ def main():
         return model
 
     def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
+        images = []
+        for image in examples[image_column]:
+            rgb_image = image.convert("RGB")
+            # Add small noise to break channel symmetry and prevent color artifacts
+            rgb_array = np.array(rgb_image, dtype=np.float32)
+            noise = np.random.normal(0, 1, rgb_array.shape) * 0.5  # Small noise per channel
+            rgb_array = np.clip(rgb_array + noise, 0, 255).astype(np.uint8)
+            rgb_image = transforms.ToPILImage()(rgb_array)
+            images.append(rgb_image)
+        
         examples["pixel_values"] = [train_transforms(image) for image in images]
         examples["input_ids"] = tokenize_captions(examples)
         return examples
@@ -849,6 +872,18 @@ def main():
     else:
         initial_global_step = 0
 
+    # Open CSV file for logging losses
+    loss_log_file = None
+    loss_csv_writer = None
+    if accelerator.is_main_process:
+        loss_log_path = os.path.join(args.output_dir, "losses.csv")
+        loss_log_file = open(loss_log_path, "a", newline="")
+        loss_csv_writer = csv.writer(loss_log_file)
+        # Write header if file is empty
+        if initial_global_step == 0:
+            loss_csv_writer.writerow(["step", "epoch", "loss", "learning_rate"])
+            loss_log_file.flush()
+
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=initial_global_step,
@@ -938,6 +973,13 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
+                
+                # Log losses to CSV file
+                if accelerator.is_main_process and loss_csv_writer is not None:
+                    current_lr = lr_scheduler.get_last_lr()[0] if hasattr(lr_scheduler, 'get_last_lr') else optimizer.param_groups[0]['lr']
+                    loss_csv_writer.writerow([global_step, epoch, train_loss, current_lr])
+                    loss_log_file.flush()
+                
                 train_loss = 0.0
 
                 if global_step % args.checkpointing_steps == 0:
@@ -987,6 +1029,11 @@ def main():
 
                 del pipeline
                 torch.cuda.empty_cache()
+
+    # Close loss log file
+    if accelerator.is_main_process and loss_log_file is not None:
+        loss_log_file.close()
+        logger.info(f"Loss metrics saved to {os.path.join(args.output_dir, 'losses.csv')}")
 
     # Save the lora layers
     accelerator.wait_for_everyone()
